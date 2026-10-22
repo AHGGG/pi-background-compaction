@@ -1,0 +1,52 @@
+{
+  "name": "pi-background-compaction",
+  "version": "0.1.0",
+  "description": "Optional safe-boundary background preparation for Pi compaction engines.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "compaction",
+    "background"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "biome check --vcs-use-ignore-file=false src test package.json tsconfig.json biome.json && tsc --noEmit",
+    "format": "biome check --write --vcs-use-ignore-file=false src test package.json tsconfig.json biome.json",
+    "test": "vitest run --dir test --testTimeout=5000",
+    "test:integration": "node scripts/test-integration.mjs"
+  },
+  "dependencies": {
+    "@narumitw/pi-tui-kit": "^0.59.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/node": "26.6.4",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3",
+    "@earendil-works/pi-tui": "1.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AHGGG/pi-background-compaction"
+  }
+}
