@@ -135,7 +135,7 @@ test("cancel while waiting never falls back or starts a duplicate request", asyn
   await h.emit("session_shutdown", {});
 });
 
-test("failed background request pauses warm-ahead and reports recovery at adoption", async () => {
+test("failed background request tries foreground once before native fallback", async () => {
   const h = fixture();
   await h.emit("session_start", {});
   await h.start();
@@ -143,14 +143,20 @@ test("failed background request pauses warm-ahead and reports recovery at adopti
   h.fail();
   h.release();
   assert.equal(await h.compact(), undefined);
-  assert.equal(h.fetches, 1);
+  assert.equal(h.fetches, 2, "background failure permits one fresh foreground attempt");
   assert.match(h.notifications.map(({ message }) => message).join("\n"), /using Pi compaction/);
   await h.emit("session_shutdown", {});
 });
 
-test("owned deadline bounds a signal-ignoring provider without another request", async () => {
+test("owned background deadline permits exactly one fresh foreground request", async () => {
   vi.useFakeTimers();
   const h = fixture({ requestTimeoutMs: 30_000 });
+  const timeouts: Array<number | undefined> = [];
+  const stream = h.provider.stream;
+  h.provider.stream = (...args) => {
+    timeouts.push(args[2]?.timeoutMs);
+    return stream(...args);
+  };
   try {
     await h.emit("session_start", {});
     await h.start();
@@ -158,8 +164,17 @@ test("owned deadline bounds a signal-ignoring provider without another request",
     await vi.advanceTimersByTimeAsync(30_000);
     assert.equal(h.requestSignals[0].aborted, true);
     assert.equal(h.notifications.filter(({ message }) => message.includes("Warm-ahead paused")).length, 1);
-    assert.equal(await h.compact(), undefined);
-    assert.equal(h.fetches, 1);
+    const foreground = h.compact();
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(h.fetches, 2);
+    assert.equal(h.requestSignals[1].aborted, false);
+    assert.notEqual(h.requestSignals[1], h.requestSignals[0]);
+    assert.deepEqual(timeouts, [30_000, 30_000], "each adapter receives its own configured timeout");
+    // This deliberately noncompliant adapter ignores timeoutMs; settle its foreground call explicitly.
+    h.fail();
+    h.release();
+    assert.equal(await foreground, undefined);
+    assert.equal(h.fetches, 2);
     assert.match(h.notifications.map(({ message }) => message).join("\n"), /timed out/);
   } finally {
     h.release();
@@ -188,8 +203,12 @@ test("pending adoption waits for the original deadline before refreshing auth", 
     const adoption = h.compact();
     await vi.advanceTimersByTimeAsync(30_000);
     assert.equal(prematureAuth, false);
+    assert.equal(h.fetches, 2, "foreground starts only after the background deadline");
+    assert.equal(h.requestSignals[1].aborted, false);
+    h.fail();
+    h.release();
     assert.equal(await adoption, undefined);
-    assert.equal(h.fetches, 1);
+    assert.equal(h.fetches, 2);
     assert.match(h.notifications.map(({ message }) => message).join("\n"), /timed out/);
   } finally {
     authGate.resolve();
@@ -360,7 +379,7 @@ function priorCheckpoint(h: ReturnType<typeof fixture>) {
 }
 
 for (const mode of ["failure", "timeout"] as const)
-  test(`${mode} with opaque history recovers current suffix once, without repeating warmup`, async () => {
+  test(`${mode} with opaque history tries foreground once before recovering current suffix`, async () => {
     if (mode === "timeout") vi.useFakeTimers();
     const h = fixture({ requestTimeoutMs: 30_000 });
     priorCheckpoint(h);
@@ -389,10 +408,12 @@ for (const mode of ["failure", "timeout"] as const)
       h.release();
       const result = (await h.compact()) as { compaction: { summary: string; details: unknown } };
       assert.equal(result.compaction.summary, "done");
-      assert.equal(h.fetches, 2);
-      assert.equal(h.captured.length, 2);
-      assert.match(JSON.stringify(h.captured[1]), /suffix-call/);
-      assert.match(JSON.stringify(h.captured[1]), /suffix-result/);
+      assert.equal(h.fetches, 3, "background, fresh checkpoint, then summary recovery");
+      assert.equal(h.captured.length, 3);
+      for (const request of h.captured.slice(1)) {
+        assert.match(JSON.stringify(request), /suffix-call/);
+        assert.match(JSON.stringify(request), /suffix-result/);
+      }
       assert.equal(
         latestCheckpoint(h.manager.getBranch())?.details.replacementHistory[0].encrypted_content,
         "old-opaque",
@@ -414,7 +435,7 @@ test("opaque-history cancel policy preserves checkpoint after failed background"
   h.fail();
   h.release();
   assert.deepEqual(await h.compact(), { cancel: true });
-  assert.equal(h.fetches, 1);
+  assert.equal(h.fetches, 2, "one foreground checkpoint attempt before safe cancellation");
   assert.ok(latestCheckpoint(h.manager.getBranch()));
   await h.emit("session_shutdown", {});
 });
@@ -471,6 +492,7 @@ test("a late custom-provider callback cannot dispatch after the owned deadline",
   vi.useFakeTimers();
   const h = fixture({ requestTimeoutMs: 30_000 });
   const savedFetch = deferred<typeof globalThis.fetch>();
+  const originalStream = h.provider.stream;
   h.provider.stream = (_model, _context, options) => {
     assert.ok(options?.fetch);
     savedFetch.resolve(options.fetch);
@@ -484,8 +506,13 @@ test("a late custom-provider callback cannot dispatch after the owned deadline",
     // Deliberately omit init.signal, as a noncompliant adapter might.
     await assert.rejects(() => lateFetch("https://example.test/responses", { method: "POST" }), /timed out/);
     assert.equal(h.fetches, 0);
+    h.provider.stream = originalStream;
+    h.fail();
+    h.release();
     assert.equal(await h.compact(), undefined);
-    assert.equal(h.fetches, 0);
+    assert.equal(h.fetches, 1, "only the fresh foreground adapter may dispatch");
+    await assert.rejects(() => lateFetch("https://example.test/responses", { method: "POST" }), /timed out/);
+    assert.equal(h.fetches, 1, "the old callback remains blocked after foreground fallback");
   } finally {
     await h.emit("session_shutdown", {});
     vi.useRealTimers();
