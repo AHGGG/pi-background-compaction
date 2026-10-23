@@ -640,7 +640,7 @@ test("logging reports failed warm preparation and native fallback without provid
   await new Promise<void>((resolve) => setImmediate(resolve));
   await h.compact();
   const logs = lifecycleLogs(h).join("\n");
-  assert.match(logs, /Async compaction failed/);
+  assert.match(logs, /Async compaction failed: .*elapsed: \d+\.\ds/);
   assert.match(logs, /foreground compaction path/);
   assert.match(logs, /using the foreground compaction path/);
   assert.doesNotMatch(logs, /fixture failure|fixture-key/);

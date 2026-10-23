@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { createBackgroundCompactionExtension } from "../src/background-compaction.js";
 import {
   COMPACTION_ENGINE_AVAILABLE,
   COMPACTION_ENGINE_REQUEST,
   type CompactionEngineRequest,
   type CompactionEngineV1,
+  type PreparedCheckpoint,
   type PreparedCompactionSource,
 } from "../src/prepared-compaction-protocol.js";
 import { type BackgroundCompactionSettingsRuntime, DEFAULT_BACKGROUND_COMPACTION_SETTINGS } from "../src/settings.js";
@@ -267,4 +268,87 @@ test("reentrant notification invalidates the final boundary handoff", async () =
   );
   assert.equal(h.starts, 1);
   await h.emit("session_shutdown");
+});
+
+test("preparation warning and lifecycle log show safe cause and elapsed time", async () => {
+  const h = fixture();
+  const clock = vi.spyOn(performance, "now").mockReturnValue(1000);
+  h.engine.capture = () => ({
+    requestTimeoutMs: 500,
+    isCurrent: () => true,
+    start: async () => {
+      clock.mockReturnValue(3500);
+      return { usable: false, failure: "HTTP 429: rate limited" } as PreparedCheckpoint;
+    },
+  });
+  try {
+    await h.emit("session_start");
+    await h.turn();
+    await drain();
+    const warning = h.notices.find((message) => message.includes("Warm-ahead paused"));
+    const log = h.notices.find((message) => message.includes("Async compaction failed"));
+    assert.match(warning ?? "", /HTTP 429: rate limited \(elapsed: 2\.5s\)/);
+    assert.match(log ?? "", /HTTP 429: rate limited \(elapsed: 2\.5s\)/);
+  } finally {
+    clock.mockRestore();
+    await h.emit("session_shutdown");
+  }
+});
+
+test("engine failure display is bounded and terminal safe", async () => {
+  const h = fixture();
+  h.engine.capture = () => ({
+    requestTimeoutMs: 500,
+    isCurrent: () => true,
+    start: async () =>
+      ({ usable: false, failure: `HTTP 500\n\u001b[31m\u202e ${"x".repeat(1000)}` }) as PreparedCheckpoint,
+  });
+  await h.emit("session_start");
+  await h.turn();
+  await drain();
+  const warning = h.notices.find((message) => message.includes("Warm-ahead paused")) ?? "";
+  assert.match(warning, /HTTP 500/);
+  assert.match(warning, /elapsed: \d+\.\ds/);
+  assert.ok(
+    Array.from(warning).every((char) => {
+      const code = char.codePointAt(0) ?? 0;
+      return code >= 32 && (code < 127 || code > 159) && code !== 0x202e;
+    }),
+  );
+  assert.doesNotMatch(warning, /x{201}/);
+  await h.emit("session_shutdown");
+});
+
+test("unexpected rejected engine error is not exposed in the pause warning", async () => {
+  const h = fixture();
+  h.engine.capture = () => ({
+    requestTimeoutMs: 500,
+    isCurrent: () => true,
+    start: async () => {
+      throw new Error("Bearer PRIVATE-CREDENTIAL\nconversation-private-text");
+    },
+  });
+  await h.emit("session_start");
+  await h.turn();
+  await drain();
+  assert.match(h.notices.join("\n"), /engine returned no safe diagnostic.*elapsed:/);
+  assert.doesNotMatch(h.notices.join("\n"), /PRIVATE-CREDENTIAL|conversation-private-text/);
+  await h.emit("session_shutdown");
+});
+
+test("cancelled preparation does not emit a failure pause", async () => {
+  const h = fixture();
+  const run = new AbortController();
+  const ctx = { ...h.ctx, signal: run.signal } as ExtensionContext;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 500,
+    isCurrent: () => true,
+    start: async () => new Promise<PreparedCheckpoint>(() => {}),
+  });
+  await h.emit("session_start", {}, ctx);
+  await h.turn(ctx);
+  run.abort();
+  await drain();
+  assert.doesNotMatch(h.notices.join("\n"), /Warm-ahead paused|Async compaction failed/);
+  await h.emit("session_shutdown", {}, ctx);
 });

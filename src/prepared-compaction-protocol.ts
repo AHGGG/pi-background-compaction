@@ -32,6 +32,7 @@ export interface CheckpointDraft {
 export interface PreparedCheckpoint {
   readonly checkpointId?: string;
   readonly usable: boolean;
+  /** Producer-filtered safe summary only: no credentials, request/response bodies, session content or stacks. */
   readonly failure?: string;
   adopt(event: SessionBeforeCompactEvent, ctx: ExtensionContext, guard: ApplicationGuard): Promise<CheckpointAdoption>;
   draft(ctx: ExtensionContext, guard: ApplicationGuard): Promise<CheckpointDraft>;

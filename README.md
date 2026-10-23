@@ -101,7 +101,10 @@ Failed saves keep the previous effective preferences.
 
 Preparation sends session context through the installed engine's existing provider route and authentication.
 This package does not store credentials or make independent provider requests.
-Lifecycle notices contain fixed diagnostic reasons rather than prompts or tokens.
+Preparation failures show the engine’s safe diagnostic summary and elapsed preparation time.
+Protocol producers must filter diagnostics before returning them: never include credentials, headers, request/response bodies, conversation content, checkpoint contents or stacks.
+The companion bounds and cleans these summaries for terminal display; unexpected rejected errors are reported generically rather than exposing their raw messages.
+Cancellation or session replacement is not reported as a preparation failure.
 
 ## 🚧 Limitations
 

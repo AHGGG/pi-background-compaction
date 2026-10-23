@@ -18,6 +18,16 @@ import {
 import { terminalText } from "./terminal.js";
 
 const STATUS_KEY = "background-compaction";
+// The engine owns privacy filtering; this boundary only makes its safe summary
+// bounded and terminal-safe. Never substitute a raw rejected error here.
+const failureText = (reason: string, limit = 240) =>
+  terminalText(reason)
+    .replace(/[\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit);
+const preparationFailure = (job: BackgroundJob) =>
+  `${failureText(job.applicationFailure ?? "checkpoint preparation failed", 200) || "checkpoint preparation failed"} (elapsed: ${((job.elapsedMs ?? 0) / 1000).toFixed(1)}s)`;
 type Owner = {
   controller: AbortController;
   sessionId: string;
@@ -82,6 +92,7 @@ export function createBackgroundCompactionExtension(
     };
     const pause = (ctx: ExtensionContext, owner: Owner, reason: string, generation = owner.generation) => {
       if (!owned(ctx, owner) || owner.generation !== generation || owner.pauseReason) return;
+      reason = failureText(reason) || "compaction failed";
       owner.pauseReason = reason;
       if (ctx.hasUI)
         ctx.ui.notify(
@@ -490,7 +501,7 @@ export function createBackgroundCompactionExtension(
       void started.promise.then(
         () => {
           if (owner.job !== started || !owned(ctx, owner) || !started.isCurrent()) return;
-          if (started.applicationFailure) pause(ctx, owner, started.applicationFailure);
+          if (started.applicationFailure) pause(ctx, owner, preparationFailure(started));
           if (started.state === "Ready") {
             ctx.ui.setStatus(STATUS_KEY, undefined);
             if (ctx.hasUI)
@@ -504,13 +515,16 @@ export function createBackgroundCompactionExtension(
               );
           } else {
             ctx.ui.setStatus(STATUS_KEY, undefined);
-            log(ctx, "Async compaction failed: actual compaction will use the foreground recovery path.");
+            log(
+              ctx,
+              `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.`,
+            );
           }
         },
         () => {
           if (owner.job === started && owned(ctx, owner) && started.isCurrent()) {
             ctx.ui.setStatus(STATUS_KEY, undefined);
-            pause(ctx, owner, "background preparation failed");
+            pause(ctx, owner, preparationFailure(started));
           }
         },
       );

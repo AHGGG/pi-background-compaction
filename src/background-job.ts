@@ -11,6 +11,7 @@ export interface BackgroundJob {
   isCurrent(): boolean;
   validationFailure?: string;
   applicationFailure?: string;
+  elapsedMs?: number;
 }
 
 export function startBackgroundJob(
@@ -20,6 +21,7 @@ export function startBackgroundJob(
   ownerSignal: AbortSignal,
   ownsSession: () => boolean,
 ): BackgroundJob {
+  const started = performance.now();
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, ownerSignal]);
   const settingsKey = compactionSettingsKey(runtime.get().settings);
@@ -74,11 +76,15 @@ export function startBackgroundJob(
       },
       (error: unknown) => {
         job.state = "Failed";
-        if (!signal.aborted) job.applicationFailure = "background preparation failed";
+        if (!signal.aborted)
+          job.applicationFailure = deadline.signal.aborted
+            ? "request timed out"
+            : "background preparation failed (engine returned no safe diagnostic)";
         throw error;
       },
     )
     .finally(() => {
+      job.elapsedMs = Math.max(0, performance.now() - started);
       runSignal?.removeEventListener("abort", cancelPreparing);
       clearTimeout(timeout);
       deadline.abort();

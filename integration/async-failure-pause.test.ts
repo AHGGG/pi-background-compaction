@@ -36,6 +36,7 @@ for (const failure of ["transport", "auth", "timeout"] as const)
       }
       assert.equal(pauses(h).length, 1);
       assert.doesNotMatch(pauses(h)[0].message, /PRIVATE-AUTH|fixture-key/);
+      if (failure !== "auth") assert.match(pauses(h)[0].message, /elapsed: \d+\.\ds/);
       const calls = h.fetches;
       await h.start();
       await h.start();

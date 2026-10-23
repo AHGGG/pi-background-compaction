@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { startBackgroundJob } from "../src/background-job.js";
 import type {
   ApplicationGuard,
@@ -143,6 +143,36 @@ test("rejected preparation marks failure without retaining raw error in diagnost
   const result = assert.rejects(job.promise);
   h.reject(new Error("PRIVATE-CREDENTIAL"));
   await result;
-  assert.equal(job.applicationFailure, "background preparation failed");
+  assert.equal(job.applicationFailure, "background preparation failed (engine returned no safe diagnostic)");
   assert.equal(job.state, "Failed");
+});
+
+test("failure records elapsed preparation time without extending the lifetime", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(1000);
+  try {
+    const h = fixture();
+    const job = h.start();
+    clock.mockReturnValue(3500);
+    h.resolve({ usable: false, failure: "HTTP 429: rate limited" } as PreparedCheckpoint);
+    await job.promise;
+    assert.equal(job.elapsedMs, 2500);
+    assert.equal(job.applicationFailure, "HTTP 429: rate limited");
+    clock.mockReturnValue(9000);
+    assert.equal(job.elapsedMs, 2500);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
+test("unexpected deadline rejection reports timeout without raw details", async () => {
+  const h = fixture(1);
+  h.preparation.start = (guard) =>
+    new Promise((_resolve, reject) => {
+      guard.deadlineSignal?.addEventListener("abort", () => reject(new Error("PRIVATE-CREDENTIAL")), { once: true });
+    });
+  const job = h.start();
+  await assert.rejects(job.promise);
+  assert.equal(job.applicationFailure, "request timed out");
+  assert.equal(job.isCurrent(), true);
+  assert.ok((job.elapsedMs ?? -1) >= 0);
 });
