@@ -87,8 +87,10 @@ Request timeout, provider protocol, retry policy and checkpoint retention remain
 
 ### Migration and persistence
 
+If you previously used background controls inside `/codex-compact`, use `/background-compaction` for those controls and `/background-compaction resume` to clear a failure pause. Do not rely on `/codex-compact resume`: the engine does not own the companion's commands. `/codex-compact` still controls the engine's foreground compaction settings.
+
 When the new file is absent, the companion reads only the four fields above from the adjacent `pi-codex-compact.json`.
-It never changes or removes that legacy file. The first explicit save writes the inherited background preferences plus your change to the new file, without copying provider/authentication settings.
+It never changes or removes that legacy file. Do not delete the four legacy background fields before saving your preferences in the new menu. The first explicit save writes the inherited background preferences plus your change to the new file, without copying provider/authentication settings.
 If both files exist, the new file wins entirely; missing fields use defaults rather than legacy values.
 
 A missing file causes no filesystem writes. Invalid files are reported and block saving until repaired, rather than being overwritten with defaults.
