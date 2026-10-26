@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -96,14 +96,29 @@ async function loadSingleSettings(
   signal?: AbortSignal,
 ): Promise<BackgroundCompactionSettingsState> {
   aborted(signal);
+  let observedPath = false;
   try {
-    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    // O_NOFOLLOW is not enforced on every platform (notably Windows).
+    const before = await lstat(path, { bigint: true });
+    observedPath = true;
+    if (before.isSymbolicLink()) throw new Error("symbolic links are not accepted");
+    if (!before.isFile()) throw new Error("settings path is not a regular file");
+    const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     let text: string;
     try {
-      const stats = await handle.stat();
+      const stats = await handle.stat({ bigint: true });
+      const current = await lstat(path, { bigint: true });
       aborted(signal);
+      if (current.isSymbolicLink()) throw new Error("symbolic links are not accepted");
+      if (
+        before.dev !== stats.dev ||
+        before.ino !== stats.ino ||
+        current.dev !== stats.dev ||
+        current.ino !== stats.ino
+      )
+        throw new Error("settings path changed while opening");
       if (!stats.isFile()) throw new Error("settings path is not a regular file");
-      if (stats.size > MAX_SETTINGS_BYTES) throw new Error("settings file exceeds 64 KiB");
+      if (stats.size > BigInt(MAX_SETTINGS_BYTES)) throw new Error("settings file exceeds 64 KiB");
       text = await handle.readFile("utf8");
     } finally {
       await handle.close();
@@ -115,7 +130,7 @@ async function loadSingleSettings(
     return { kind: "loaded", path, settings, document, source: "canonical" };
   } catch (error) {
     if (signal?.aborted) throw error;
-    if (isNodeError(error) && error.code === "ENOENT") {
+    if (!observedPath && isNodeError(error) && error.code === "ENOENT") {
       return {
         kind: "missing",
         path,

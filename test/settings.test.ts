@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import * as fsPromises from "node:fs/promises";
-import { mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, test, vi } from "vitest";
@@ -14,7 +14,7 @@ import {
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, rename: vi.fn(actual.rename) };
+  return { ...actual, lstat: vi.fn(actual.lstat), rename: vi.fn(actual.rename) };
 });
 
 const directories: string[] = [];
@@ -178,8 +178,16 @@ test("oversized files and symlinks are rejected without writes", async () => {
   await rm(path);
   const target = join(dirname(path), "target.json");
   await writeFile(target, "{}");
-  await symlink(target, path);
-  assert.match((await loadBackgroundCompactionSettings(path)).issue ?? "", /symbolic links/);
+  await symlink(target, path, "file");
+  assert.equal((await lstat(path)).isSymbolicLink(), true);
+  const loaded = await loadBackgroundCompactionSettings(path);
+  assert.match(loaded.issue ?? "", /symbolic links/);
+  assert.equal(loaded.settings.asyncEnabled, false);
+  assert.equal(loaded.kind, "invalid");
+  const runtime = createBackgroundCompactionSettingsRuntime(path);
+  await assert.rejects(runtime.update({ logCompaction: false }), /Cannot overwrite/);
+  assert.equal(await readFile(target, "utf8"), "{}");
+  assert.equal((await lstat(path)).isSymbolicLink(), true);
 });
 
 test("atomic publication failure leaves the prior document and runtime intact", async () => {
@@ -227,3 +235,55 @@ for (const source of ["canonical", "legacy"] as const) {
     assert.deepEqual(JSON.parse(await readFile(input, "utf8")), { asyncEnabled: false });
   });
 }
+
+for (const source of ["canonical", "legacy"] as const) {
+  for (const dangling of [false, true]) {
+    test(`${source} ${dangling ? "dangling" : "live"} symlink is invalid, never defaults or writable`, async () => {
+      const path = await settingsPath();
+      const input = source === "canonical" ? path : join(dirname(path), "pi-codex-compact.json");
+      const target = join(dirname(path), "target.json");
+      if (!dangling) await writeFile(target, "{}");
+      await symlink(target, input, "file");
+      assert.equal((await lstat(input)).isSymbolicLink(), true);
+      const loaded = await loadBackgroundCompactionSettings(path);
+      assert.equal(loaded.kind, "invalid");
+      assert.equal(loaded.settings.asyncEnabled, false);
+      assert.match(loaded.issue ?? "", /symbolic links/);
+      const runtime = createBackgroundCompactionSettingsRuntime(path);
+      await assert.rejects(runtime.update({ logCompaction: true }), /Cannot overwrite/);
+      assert.equal((await lstat(input)).isSymbolicLink(), true);
+      if (dangling) await assert.rejects(stat(target), { code: "ENOENT" });
+      else assert.equal(await readFile(target, "utf8"), "{}");
+      if (source === "legacy") await assert.rejects(stat(path), { code: "ENOENT" });
+    });
+  }
+}
+
+test("path replacement or disappearance after open fails closed", async () => {
+  const path = await settingsPath();
+  await writeFile(path, "{}");
+  const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+  const original = await actual.lstat(path, { bigint: true });
+  const mock = vi.mocked(fsPromises.lstat);
+  for (const mutation of ["symlink", "identity", "missing"] as const) {
+    mock.mockImplementationOnce(actual.lstat).mockImplementationOnce(async () => {
+      if (mutation === "missing") throw Object.assign(new Error("removed"), { code: "ENOENT" });
+      return Object.assign(Object.create(Object.getPrototypeOf(original)), original, {
+        ino: mutation === "identity" ? original.ino + 1n : original.ino,
+        isSymbolicLink: () => mutation === "symlink",
+      });
+    });
+    try {
+      const loaded = await loadBackgroundCompactionSettings(path);
+      assert.equal(loaded.kind, "invalid");
+      assert.equal(loaded.settings.asyncEnabled, false);
+      assert.match(
+        loaded.issue ?? "",
+        mutation === "symlink" ? /symbolic links/ : mutation === "identity" ? /changed while opening/ : /removed/,
+      );
+      assert.equal(await readFile(path, "utf8"), "{}");
+    } finally {
+      mock.mockReset().mockImplementation(actual.lstat);
+    }
+  }
+});

@@ -1,6 +1,8 @@
 # pi-background-compaction
 
-Prepare a compaction checkpoint in the background while Pi continues working. When compaction is needed, Pi can reuse that checkpoint instead of starting from scratch.
+Reduce compaction pauses and keep your coding tasks moving by preparing checkpoints in the background. When compaction is needed, Pi can reuse a prepared checkpoint instead of starting from scratch.
+
+English | [简体中文](README.zh-CN.md)
 
 Background preparation and automatic application are on by default. It may consume provider quota even if the checkpoint is never used. It can reduce waiting, but does not guarantee faster or cheaper compaction.
 
@@ -33,6 +35,22 @@ There are two ways to use a prepared checkpoint:
 - **Leave Apply when ready on (default):** the extension can apply it after the current model/tool batch or at the next idle input boundary, once validation succeeds.
 
 A **Ready** checkpoint has been prepared, not yet written into the session. Changes to the session, model, provider, tools, or relevant settings can make it unusable. The engine checks it before applying it.
+
+## How it works
+
+With the default settings:
+
+```mermaid
+flowchart TD
+    A[Pi works on your task] --> B[Turn completes with context usage at 70% or more]
+    B --> C[Prepare a checkpoint in the background]
+    C -.-> D[Pi can keep working]
+    C --> E[Checkpoint ready]
+    E --> F[Validate at a safe boundary]
+    F --> G[Apply checkpoint and continue]
+```
+
+A safe boundary is after the current model/tool batch or at the next idle input boundary, not in the middle of an active request. If actual compaction starts before preparation finishes, it waits for compatible background work. If that work fails or cannot be used, the engine runs compaction in the foreground.
 
 ## Manual and automatic compaction
 
