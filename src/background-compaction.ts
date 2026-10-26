@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { abortable } from "./abortable.js";
 import { type BackgroundJob, startBackgroundJob } from "./background-job.js";
 import { CompactionTimings } from "./compaction-timing.js";
+import { supportsPreparationDiagnostics } from "./preparation-diagnostics.js";
 import {
   COMPACTION_ENGINE_AVAILABLE,
   COMPACTION_ENGINE_REQUEST,
@@ -33,6 +34,7 @@ type Owner = {
   sessionId: string;
   job?: BackgroundJob;
   pauseReason?: string;
+  lastFailureReport?: string;
   generation: number;
   operation?: AbortController;
   compactionPending?: boolean;
@@ -93,13 +95,19 @@ export function createBackgroundCompactionExtension(
       owner.boundaryCheckpoint = undefined;
       ctx.ui.setStatus(STATUS_KEY, undefined);
     };
-    const pause = (ctx: ExtensionContext, owner: Owner, reason: string, generation = owner.generation) => {
+    const pause = (
+      ctx: ExtensionContext,
+      owner: Owner,
+      reason: string,
+      generation = owner.generation,
+      diagnosticContext?: string,
+    ) => {
       if (!owned(ctx, owner) || owner.generation !== generation || owner.pauseReason) return;
       reason = failureText(reason) || "compaction failed";
       owner.pauseReason = reason;
       if (ctx.hasUI)
         ctx.ui.notify(
-          `[background-compaction] Warm-ahead paused for this session. Reason: ${reason}. Manual /compact and Pi automatic compaction remain available. Use /background-compaction resume to retry.`,
+          `[background-compaction] Warm-ahead paused for this session. Reason: ${reason}.${diagnosticContext ? ` ${diagnosticContext}.` : ""} Manual /compact and Pi automatic compaction remain available. Use /background-compaction resume to retry.`,
           "warning",
         );
     };
@@ -117,6 +125,39 @@ export function createBackgroundCompactionExtension(
           "Warm-ahead resumed for this session; preparation can start after the next completed turn.",
           "info",
         );
+    };
+    const watchPreparation = (ctx: ExtensionContext, owner: Owner, job: BackgroundJob) => {
+      let warned = false;
+      let timer: ReturnType<typeof setInterval> | undefined;
+      const stop = () => {
+        if (timer) clearInterval(timer);
+        timer = undefined;
+        job.controller.signal.removeEventListener("abort", stop);
+        owner.controller.signal.removeEventListener("abort", stop);
+      };
+      const update = () => {
+        if (!owned(ctx, owner) || owner.job !== job || job.state !== "Preparing" || job.controller.signal.aborted) {
+          stop();
+          return;
+        }
+        if (!job.isProgressCurrent()) {
+          cancelJob(ctx, "background preparation lifetime or settings changed");
+          stop();
+          return;
+        }
+        const diagnostics = job.refreshDiagnostics();
+        if (diagnostics?.status) ctx.ui.setStatus(STATUS_KEY, diagnostics.status);
+        if (diagnostics?.warning && !warned) {
+          warned = true;
+          ctx.ui.notify(`[background-compaction] ${diagnostics.warning}`, "info");
+        }
+      };
+      timer = setInterval(update, 5_000);
+      timer.unref?.();
+      job.controller.signal.addEventListener("abort", stop, { once: true });
+      owner.controller.signal.addEventListener("abort", stop, { once: true });
+      void job.promise.then(stop, stop);
+      update();
     };
     const confirmBoundary = (ctx: ExtensionContext) => {
       const owner = owners.get(ctx.sessionManager);
@@ -331,14 +372,31 @@ export function createBackgroundCompactionExtension(
     };
 
     pi.registerCommand("background-compaction", {
-      description: "Configure background compaction or resume a paused session",
+      description: "Configure background compaction, show diagnostics, or resume a paused session",
       getArgumentCompletions: (prefix) =>
-        "resume".startsWith(prefix) ? [{ value: "resume", label: "resume — retry background preparation" }] : [],
+        [
+          { value: "resume", label: "resume — retry background preparation" },
+          { value: "diagnostics", label: "diagnostics — show current and last failed preparation reports" },
+        ].filter(({ value }) => value.startsWith(prefix)),
       handler: async (args, ctx) => {
-        if (args.trim() && args.trim() !== "resume") throw new Error("Usage: /background-compaction [resume]");
+        if (args.trim() && !["resume", "diagnostics"].includes(args.trim()))
+          throw new Error("Usage: /background-compaction [resume|diagnostics]");
         const owner = ownerFor(ctx);
         if (args.trim() === "resume") {
           resume(ctx, owner);
+          return;
+        }
+        if (args.trim() === "diagnostics") {
+          if (!owned(ctx, owner)) return;
+          const current = owner.job?.refreshDiagnostics()?.report;
+          const reports = [
+            ...(current ? [`Current preparation:\n${current}`] : []),
+            ...(owner.lastFailureReport && owner.lastFailureReport !== current
+              ? [`Last failed preparation:\n${owner.lastFailureReport}`]
+              : []),
+          ];
+          if (ctx.hasUI)
+            ctx.ui.notify(reports.join("\n\n") || "No preparation diagnostics available in this session.", "info");
           return;
         }
         const { showBackgroundCompactionMenu } = await import("./settings-menu.js");
@@ -347,6 +405,9 @@ export function createBackgroundCompactionExtension(
           signal: owner.controller.signal,
           isCurrent: () => owned(ctx, owner),
           backgroundStatus: () => (owner.job?.state === "Failed" ? undefined : owner.job?.state),
+          preparationStatus: () =>
+            owner.job?.state === "Preparing" ? owner.job.refreshDiagnostics()?.status : undefined,
+          diagnosticReport: () => owner.lastFailureReport ?? owner.job?.refreshDiagnostics()?.report,
           warmPauseReason: () =>
             owner.pauseReason ??
             (!engine ? (connectionIssue ?? "No compatible compaction engine installed.") : undefined),
@@ -499,11 +560,15 @@ export function createBackgroundCompactionExtension(
       const started = startBackgroundJob(preparation, ctx, runtime, owner.controller.signal, () => owned(ctx, owner));
       owner.job = started;
       ctx.ui.setStatus(STATUS_KEY, "Preparing checkpoint…");
+      if (ctx.hasUI && supportsPreparationDiagnostics(preparation)) watchPreparation(ctx, owner, started);
       log(ctx, "Async compaction triggered: preparing a checkpoint in the background.");
       void started.promise.then(
         () => {
           if (owner.job !== started || !owned(ctx, owner) || !started.isCurrent()) return;
-          if (started.applicationFailure) pause(ctx, owner, preparationFailure(started));
+          if (started.state === "Failed" && started.diagnostics?.report)
+            owner.lastFailureReport = started.diagnostics.report;
+          if (started.applicationFailure)
+            pause(ctx, owner, preparationFailure(started), owner.generation, started.diagnosticContext);
           if (started.state === "Ready") {
             ctx.ui.setStatus(STATUS_KEY, undefined);
             if (ctx.hasUI)
@@ -525,8 +590,9 @@ export function createBackgroundCompactionExtension(
         },
         () => {
           if (owner.job === started && owned(ctx, owner) && started.isCurrent()) {
+            if (started.diagnostics?.report) owner.lastFailureReport = started.diagnostics.report;
             ctx.ui.setStatus(STATUS_KEY, undefined);
-            pause(ctx, owner, preparationFailure(started));
+            pause(ctx, owner, preparationFailure(started), owner.generation, started.diagnosticContext);
           }
         },
       );

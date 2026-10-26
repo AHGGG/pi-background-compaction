@@ -10,6 +10,8 @@ The supplied checkout must contain `packages/pi-codex-compact/src/prepared-compa
 (version 1). An absent or incompatible checkout is an error, not a skipped suite.
 The runner supplies test-only aliases to that checkout's engine and mock-Pi support.
 Production source never imports those aliases or another extension's private files.
+Set `REQUIRE_PREPARATION_DIAGNOSTICS=1` when checking a new diagnostics-capable engine;
+this makes absence of the optional capability fail instead of testing the older-engine path.
 
 These tests load the real core and background factories together through Pi's event bus.
 Providers and credentials are fixtures; no external model request is made. The native-runtime

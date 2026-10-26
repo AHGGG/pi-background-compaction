@@ -67,6 +67,7 @@ flowchart TD
 | 命令 | 作用 |
 | --- | --- |
 | `/background-compaction` | 在终端界面打开 Settings、Status 和 Help。 |
+| `/background-compaction diagnostics` | 显示当前会话中保留的本次准备报告和上次失败报告。 |
 | `/background-compaction resume` | 解除当前会话因失败而进入的暂停状态。下一轮结束后可以重新开始准备。 |
 | `/compact` | 执行 Pi 的压缩，有兼容的后台任务时优先复用。 |
 
@@ -98,6 +99,8 @@ flowchart TD
 ## 失败处理和限制
 
 准备请求失败后，当前会话会暂停后续后台准备。警告会显示耗时，以及引擎提供的可安全展示的失败原因；没有可用原因时会显示通用提示。手动 `/compact` 和 Pi 自动压缩仍然可用。
+
+使用支持诊断的引擎时，状态栏会显示耗时和最近的流活动。长时间无活动的提示只是提醒，不会取消请求或缩短截止时间。引擎会在失败时自动打印有长度限制的完整报告，包含每次尝试的时间和流结束情况，因此只需复制失败日志，不必再次复现。扩展会在当前会话中保留上次失败报告，执行 `resume` 后仍可通过 Status 或 `/background-compaction diagnostics` 查看。报告不包含提示词、scratchpad 内容、凭据或检查点正文。旧版引擎仍可使用原来的简短失败提示。
 
 需要重试后台准备时，运行 `/background-compaction resume`。它只解除暂停，不会立即向服务商发送请求。
 

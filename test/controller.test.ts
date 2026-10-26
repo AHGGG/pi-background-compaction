@@ -101,15 +101,16 @@ function fixture(order: "first" | "last" | "absent" = "first") {
   installController();
   if (order === "last") installEngine();
   const notices: string[] = [];
+  const statuses: (string | undefined)[] = [];
   let onNotify: ((message: string) => void) | undefined;
-  const context = (id: string) =>
+  const context = (id: string, signal = new AbortController().signal) =>
     ({
       sessionManager: { getSessionId: () => id },
       hasUI: true,
       mode: "tui",
-      signal: new AbortController().signal,
+      signal,
       ui: {
-        setStatus: () => undefined,
+        setStatus: (_key: string, value: string | undefined) => statuses.push(value),
         notify: (message: string) => {
           notices.push(message);
           onNotify?.(message);
@@ -119,7 +120,8 @@ function fixture(order: "first" | "last" | "absent" = "first") {
       isIdle: () => false,
       hasPendingMessages: () => false,
     }) as unknown as ExtensionContext;
-  const ctx = context("one");
+  const run = new AbortController();
+  const ctx = context("one", run.signal);
   const emit = async (name: string, event: unknown = {}, target = ctx) => {
     let result: unknown;
     for (const hook of hooks.get(name) ?? []) {
@@ -136,6 +138,9 @@ function fixture(order: "first" | "last" | "absent" = "first") {
     ctx,
     settings,
     notices,
+    statuses,
+    commands,
+    run,
     emit,
     turn,
     installController,
@@ -375,4 +380,182 @@ test("cancelled preparation does not emit a failure pause", async () => {
   await drain();
   assert.doesNotMatch(h.notices.join("\n"), /Warm-ahead paused|Async compaction failed/);
   await h.emit("session_shutdown", {}, ctx);
+});
+
+test("live diagnostics update status, warn once, and retain the last failure after resume", async () => {
+  vi.useFakeTimers();
+  try {
+    const h = fixture();
+    let finish!: (value: PreparedCheckpoint) => void;
+    let status = "attempt=1 elapsed=0s";
+    let report = "safe report\nattempt=1";
+    let warning: string | undefined;
+    h.engine.capture = () => ({
+      requestTimeoutMs: 60_000,
+      isCurrent: () => true,
+      diagnostics: () => ({ status, report, warning }),
+      start: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await h.emit("session_start");
+    await h.turn();
+    assert.equal(h.statuses.at(-1), status);
+    status = "attempt=2 elapsed=5s";
+    warning = "No data for 5 minutes; still waiting. No timeout triggered.";
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(h.statuses.at(-1), status);
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(h.notices.filter((notice) => notice.includes(warning ?? "missing")).length, 1);
+    report = "safe report\nattempt=1 body=eof\nattempt=2 body=eof";
+    finish({ usable: false, failure: "incomplete response" } as PreparedCheckpoint);
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(vi.getTimerCount(), 0);
+    // Core owns the automatic report; the companion must not emit a second copy.
+    assert.equal(h.notices.filter((notice) => notice.includes("safe report")).length, 0);
+    const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
+    await command.handler("diagnostics", h.ctx);
+    assert.match(h.notices.at(-1) ?? "", /attempt=1 body=eof\nattempt=2 body=eof/);
+    await command.handler("resume", h.ctx);
+    await command.handler("diagnostics", h.ctx);
+    assert.match(h.notices.at(-1) ?? "", /Last failed preparation/);
+    assert.match(h.notices.at(-1) ?? "", /attempt=2 body=eof/);
+    await h.emit("session_shutdown");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+for (const event of ["session_before_switch", "session_shutdown", "run-abort"])
+  test(`diagnostic polling stops on ${event} even if the provider never settles`, async () => {
+    vi.useFakeTimers();
+    try {
+      const h = fixture();
+      let reads = 0;
+      h.engine.capture = () => ({
+        requestTimeoutMs: 60_000,
+        isCurrent: () => true,
+        diagnostics: () => ({ status: `read=${++reads}`, report: "safe" }),
+        start: () => new Promise(() => {}),
+      });
+      await h.emit("session_start");
+      await h.turn();
+      if (event === "run-abort") h.run.abort();
+      else await h.emit(event);
+      await vi.advanceTimersByTimeAsync(0);
+      const settledReads = reads;
+      await vi.advanceTimersByTimeAsync(10_000);
+      assert.equal(reads, settledReads);
+      assert.equal(vi.getTimerCount(), 0);
+      if (event !== "session_shutdown") await h.emit("session_shutdown");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+test("older engines have no progress polling timer", async () => {
+  vi.useFakeTimers();
+  try {
+    const h = fixture();
+    h.engine.capture = () => ({
+      requestTimeoutMs: 60_000,
+      isCurrent: () => true,
+      start: () => new Promise(() => {}),
+    });
+    await h.emit("session_start");
+    await h.turn();
+    assert.equal(vi.getTimerCount(), 1); // Existing request deadline only.
+    await h.emit("session_shutdown");
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("diagnostics remain optional when the getter itself throws", async () => {
+  const h = fixture();
+  const original = h.engine.capture;
+  h.engine.capture = (ctx) => {
+    const preparation = original(ctx);
+    assert.ok(preparation);
+    Object.defineProperty(preparation, "diagnostics", {
+      get: () => {
+        throw new Error("PRIVATE-CREDENTIAL");
+      },
+    });
+    return preparation;
+  };
+  await h.emit("session_start");
+  await h.turn();
+  await drain();
+  assert.match(h.notices.join("\n"), /Async compaction ready/);
+  assert.doesNotMatch(h.notices.join("\n"), /PRIVATE-CREDENTIAL/);
+  await h.emit("session_shutdown");
+});
+
+test("progress polling cancels stale settings without waiting for the provider", async () => {
+  vi.useFakeTimers();
+  try {
+    const h = fixture();
+    h.engine.capture = () => ({
+      requestTimeoutMs: 60_000,
+      isCurrent: () => true,
+      diagnostics: () => ({ status: "Preparing", report: "safe" }),
+      start: () => new Promise(() => {}),
+    });
+    await h.emit("session_start");
+    await h.turn();
+    h.settings.asyncThresholdPercent = 80;
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(vi.getTimerCount(), 0);
+    assert.equal(h.statuses.at(-1), undefined);
+    assert.doesNotMatch(h.notices.join("\n"), /Warm-ahead paused/);
+    await h.emit("session_shutdown");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("failure warning includes companion version and captured settings even with lifecycle logs off", async () => {
+  const h = fixture();
+  h.settings.logCompaction = false;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 60_000,
+    isCurrent: () => true,
+    start: async () => ({ usable: false, failure: "incomplete response" }) as PreparedCheckpoint,
+  });
+  await h.emit("session_start");
+  await h.turn();
+  await drain();
+  const warning = h.notices.find((notice) => notice.includes("Warm-ahead paused"));
+  assert.match(warning ?? "", /companion=\d+\.\d+\.\d+ background=on threshold=70% autoApply=on lifecycleLogs=off/);
+  assert.equal(h.notices.filter((notice) => notice.includes("Async compaction failed")).length, 0);
+  await h.emit("session_shutdown");
+});
+
+test("progress appears when an optional diagnostic getter becomes ready after startup", async () => {
+  vi.useFakeTimers();
+  try {
+    const h = fixture();
+    let ready = false;
+    h.engine.capture = () => ({
+      requestTimeoutMs: 60_000,
+      isCurrent: () => true,
+      diagnostics: () => (ready ? { status: "stream elapsed=5s", report: "safe" } : undefined) as never,
+      start: () => new Promise(() => {}),
+    });
+    await h.emit("session_start");
+    await h.turn();
+    assert.equal(h.statuses.at(-1), "Preparing checkpoint…");
+    ready = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    assert.equal(h.statuses.at(-1), "stream elapsed=5s");
+    await h.emit("session_shutdown");
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
 });

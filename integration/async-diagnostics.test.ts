@@ -151,3 +151,41 @@ test("binding diagnostics remain silent without UI", async () => {
   assert.equal(await h.start(), undefined);
   assert.equal(h.notifications.length, previousCount);
 });
+
+for (const failure of ["transport", "auth"] as const)
+  test(`automatic ${failure} report is copyable without opening diagnostics or enabling lifecycle logs`, async () => {
+    const h = fixture({ logCompaction: false, maxRetries: 0 });
+    await h.emit("session_start", {});
+    const capable = typeof h.engine().capture(h.ctx)?.diagnostics === "function";
+    if (process.env.REQUIRE_PREPARATION_DIAGNOSTICS === "1")
+      assert.equal(capable, true, "this verification run requires the new engine diagnostics capability");
+    if (failure === "transport") h.fail();
+    else
+      h.ctx.modelRegistry.getApiKeyAndHeaders = async () => {
+        throw new Error("PRIVATE-AUTH-ERROR");
+      };
+    await h.start();
+    if (failure === "transport") await h.started;
+    h.release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const initial = h.notifications.map(({ message }) => message);
+    assert.equal(initial.filter((message) => message.includes("Warm-ahead paused")).length, 1);
+    assert.doesNotMatch(initial.join("\n"), /PRIVATE-AUTH-ERROR|fixture-key|snapshot user|example\.test/);
+    if (capable) {
+      const reports = initial.filter((message) => message.includes("Compaction diagnostics"));
+      assert.equal(reports.length, 1, "exactly one full report is emitted automatically by the engine");
+      assert.match(reports[0], /utc=/);
+      assert.match(reports[0], /timeoutMs=/);
+      assert.match(reports[0], /termination=/);
+      await h.commands.get("background-compaction")?.handler("resume", h.ctx);
+      await h.commands.get("background-compaction")?.handler("diagnostics", h.ctx);
+      const retained = h.notifications.at(-1)?.message ?? "";
+      assert.match(retained, /Last failed preparation/);
+      assert.match(retained, /Compaction diagnostics/);
+      assert.match(retained, /companion=\d+\.\d+\.\d+/);
+      assert.doesNotMatch(retained, /PRIVATE-AUTH-ERROR|fixture-key|snapshot user|example\.test/);
+    } else {
+      assert.equal(initial.filter((message) => message.includes("Compaction diagnostics")).length, 0);
+    }
+    await h.emit("session_shutdown", {});
+  });

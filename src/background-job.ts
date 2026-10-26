@@ -1,7 +1,13 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { abortable } from "./abortable.js";
-import type { CheckpointPreparation, PreparedCheckpoint } from "./prepared-compaction-protocol.js";
+import { readPreparationDiagnostics } from "./preparation-diagnostics.js";
+import type {
+  CheckpointPreparation,
+  PreparationDiagnostics,
+  PreparedCheckpoint,
+} from "./prepared-compaction-protocol.js";
 import { type BackgroundCompactionSettingsRuntime, compactionSettingsKey } from "./settings.js";
+import { BACKGROUND_COMPACTION_VERSION } from "./version.js";
 
 /** Controller-owned lifetime. Engines return opaque results, never schedule jobs. */
 export interface BackgroundJob {
@@ -9,9 +15,14 @@ export interface BackgroundJob {
   promise: Promise<PreparedCheckpoint>;
   state: "Preparing" | "Ready" | "Failed";
   isCurrent(): boolean;
+  /** Cheap lifetime/settings check only; never rebuilds the engine snapshot. */
+  isProgressCurrent(): boolean;
   validationFailure?: string;
   applicationFailure?: string;
   elapsedMs?: number;
+  diagnostics?: PreparationDiagnostics;
+  diagnosticContext: string;
+  refreshDiagnostics(): PreparationDiagnostics | undefined;
 }
 
 export function startBackgroundJob(
@@ -24,7 +35,8 @@ export function startBackgroundJob(
   const started = performance.now();
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, ownerSignal]);
-  const settingsKey = compactionSettingsKey(runtime.get().settings);
+  const settings = runtime.get().settings;
+  const settingsKey = compactionSettingsKey(settings);
   const runSignal = ctx.signal;
   const cancelPreparing = () => controller.abort();
   runSignal?.addEventListener("abort", cancelPreparing, { once: true });
@@ -36,7 +48,19 @@ export function startBackgroundJob(
   const job: BackgroundJob = {
     controller,
     state: "Preparing",
+    diagnosticContext: `companion=${BACKGROUND_COMPACTION_VERSION} background=${settings.asyncEnabled ? "on" : "off"} threshold=${settings.asyncThresholdPercent}% autoApply=${settings.asyncAutoApply ? "on" : "off"} lifecycleLogs=${settings.logCompaction ? "on" : "off"}`,
     promise: undefined as unknown as Promise<PreparedCheckpoint>,
+    refreshDiagnostics() {
+      if (job.state === "Preparing") {
+        const snapshot = readPreparationDiagnostics(preparation);
+        if (snapshot)
+          job.diagnostics = { ...snapshot, report: `${job.diagnosticContext}\n${snapshot.report}`.slice(0, 16_384) };
+      }
+      return job.diagnostics;
+    },
+    isProgressCurrent() {
+      return !signal.aborted && ownsSession() && compactionSettingsKey(runtime.get().settings) === settingsKey;
+    },
     isCurrent() {
       const reason = signal.aborted
         ? "background job was cancelled"
@@ -70,11 +94,13 @@ export function startBackgroundJob(
   job.promise = job.promise
     .then(
       (prepared) => {
+        job.refreshDiagnostics();
         job.state = prepared.usable ? "Ready" : "Failed";
         job.applicationFailure = prepared.failure;
         return prepared;
       },
       (error: unknown) => {
+        job.refreshDiagnostics();
         job.state = "Failed";
         if (!signal.aborted)
           job.applicationFailure = deadline.signal.aborted

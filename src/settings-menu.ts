@@ -15,13 +15,20 @@ export interface SettingsMenuOwner {
   isCurrent(): boolean;
   backgroundStatus?(): "Preparing" | "Ready" | undefined;
   warmPauseReason?(): string | undefined;
+  preparationStatus?(): string | undefined;
+  diagnosticReport?(): string | undefined;
   onResumeWarm?(): void;
   onSettingsChanged?(): void;
 }
 
 type MenuOptions = Pick<
   SettingsMenuOwner,
-  "backgroundStatus" | "warmPauseReason" | "onResumeWarm" | "onSettingsChanged"
+  | "backgroundStatus"
+  | "warmPauseReason"
+  | "preparationStatus"
+  | "diagnosticReport"
+  | "onResumeWarm"
+  | "onSettingsChanged"
 >;
 
 export function createBackgroundCompactionMenu(
@@ -54,6 +61,7 @@ export function createBackgroundCompactionMenu(
     `Apply when ready: ${state.settings.asyncAutoApply ? "On" : "Off"}`,
     `Lifecycle logs: ${state.settings.logCompaction ? "On" : "Off"}`,
     `Prepared checkpoint: ${options.backgroundStatus?.() ?? "none"}`,
+    ...(options.preparationStatus?.() ? [`Preparation: ${safeText(options.preparationStatus() ?? "")}`] : []),
     ...(options.warmPauseReason?.() ? [`Paused: ${safeText(options.warmPauseReason() ?? "")}`] : []),
     `Settings: ${safeText(state.path)}`,
     ...(state.source === "legacy"
@@ -126,7 +134,16 @@ export function createBackgroundCompactionMenu(
       status: ({ state }) => ({
         kind: "detail",
         title: "Background Compaction Status",
-        lines: status(state),
+        lines: [
+          ...status(state),
+          ...(options.diagnosticReport?.()
+            ? [
+                "",
+                "Latest retained diagnostic report:",
+                ...(options.diagnosticReport() ?? "").split("\n").map(safeText),
+              ]
+            : []),
+        ],
         hint: "back",
       }),
       help: () => ({
@@ -137,6 +154,8 @@ export function createBackgroundCompactionMenu(
           "Enable background preparation in Settings. Automatic application is a separate opt-in.",
           "A prepared checkpoint applies only at a safe Pi boundary. Manual /compact remains available.",
           "Use /background-compaction resume to clear a session-only failure pause.",
+          "Failures print a complete report when the engine supports diagnostics; /background-compaction diagnostics shows retained reports.",
+          "Preparation progress and inactivity advisories do not change the request deadline.",
           "Settings apply immediately and are saved in user action order; Escape does not undo saved changes.",
         ],
         hint: "back",
@@ -182,6 +201,8 @@ export async function showBackgroundCompactionMenu(
     createBackgroundCompactionMenu(runtime, {
       backgroundStatus: owner.backgroundStatus,
       warmPauseReason: owner.warmPauseReason,
+      preparationStatus: owner.preparationStatus,
+      diagnosticReport: owner.diagnosticReport,
       onResumeWarm: () => {
         if (!owner.signal.aborted && owner.isCurrent()) owner.onResumeWarm?.();
       },

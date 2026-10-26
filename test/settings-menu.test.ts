@@ -273,3 +273,16 @@ test("invalidation waits for durable save and failed save leaves displayed value
   if (screen.kind !== "settings") assert.fail("expected settings");
   assert.equal(screen.items.find((item) => item.id === "asyncEnabled")?.currentValue, "On");
 });
+
+test("status retains readable multiline diagnostics without expanding the main menu", () => {
+  const { runtime } = memoryRuntime();
+  const menu = createBackgroundCompactionMenu(runtime, {
+    preparationStatus: () => "elapsed=5s lastByte=2s",
+    diagnosticReport: () => "attempt=1 body=eof\nattempt=2 body=eof",
+  });
+  const main = resolveMenuScreen(menu, "main", runtime.get());
+  const status = resolveMenuScreen(menu, "status", runtime.get());
+  assert.match(main.lines?.join("\n") ?? "", /elapsed=5s lastByte=2s/);
+  assert.doesNotMatch(main.lines?.join("\n") ?? "", /attempt=1/);
+  assert.match(status.lines?.join("\n") ?? "", /attempt=1 body=eof\nattempt=2 body=eof/);
+});

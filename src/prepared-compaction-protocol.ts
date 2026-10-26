@@ -37,8 +37,16 @@ export interface PreparedCheckpoint {
   adopt(event: SessionBeforeCompactEvent, ctx: ExtensionContext, guard: ApplicationGuard): Promise<CheckpointAdoption>;
   draft(ctx: ExtensionContext, guard: ApplicationGuard): Promise<CheckpointDraft>;
 }
+/** Producer-filtered bounded metadata only; never include request/response content or credentials. */
+export interface PreparationDiagnostics {
+  status: string;
+  report: string;
+  warning?: string;
+}
 export interface CheckpointPreparation {
   readonly requestTimeoutMs: number;
+  /** Optional additive diagnostics support; the producer owns automatic failure-report emission. */
+  diagnostics?(): PreparationDiagnostics;
   readonly reason?: string;
   isCurrent(): boolean;
   start(guard: ApplicationGuard & { ownsStatus(): boolean; deadlineSignal?: AbortSignal }): Promise<PreparedCheckpoint>;

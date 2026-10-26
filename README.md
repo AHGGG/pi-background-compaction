@@ -67,6 +67,7 @@ With **Apply when ready** enabled, a ready checkpoint is not applied during a fa
 | Command | Action |
 | --- | --- |
 | `/background-compaction` | Open Settings, Status, and Help in the terminal UI. |
+| `/background-compaction diagnostics` | Show the current and last failed preparation reports retained in this session. |
 | `/background-compaction resume` | Clear a failure pause for this session. Preparation can start after the next completed turn. |
 | `/compact` | Run Pi's compaction, reusing compatible background work when available. |
 
@@ -98,6 +99,8 @@ Once the new file exists, it takes precedence. Explicit saved values, including 
 ## Failures and limits
 
 A failed preparation request pauses further preparation for the current session. Preparation failure warnings include elapsed time and a safe reason from the engine, or a generic message if no safe reason is available. Manual `/compact` and Pi's automatic compaction remain available.
+
+With a diagnostics-capable engine, the status line shows elapsed time and recent stream activity. An inactivity notice is only advisory: it does not cancel the request or shorten its deadline. The engine automatically prints a bounded failure report, including attempt timings and stream completion details, so you can copy the failure log without reproducing it. The companion retains the last failed report for the session, including across `resume`; Status and `/background-compaction diagnostics` can show it again. Reports exclude prompts, scratchpad contents, credentials, and checkpoint bodies. Older engines continue to work with their existing short failure messages.
 
 Use `/background-compaction resume` when you want to try background preparation again. This clears the pause; it does not immediately send a provider request.
 

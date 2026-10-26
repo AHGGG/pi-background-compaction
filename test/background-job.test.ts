@@ -176,3 +176,47 @@ test("unexpected deadline rejection reports timeout without raw details", async 
   assert.equal(job.isCurrent(), true);
   assert.ok((job.elapsedMs ?? -1) >= 0);
 });
+
+test("the final safe diagnostic snapshot is captured and frozen when preparation settles", async () => {
+  const h = fixture();
+  let report = "attempt=1 elapsed=5s";
+  h.preparation.diagnostics = () => ({ status: "Preparing", report });
+  const job = h.start();
+  assert.ok(job.refreshDiagnostics()?.report.endsWith(report));
+  report = "attempt=1 body=eof\nattempt=2 body=eof";
+  h.resolve({ usable: false, failure: "incomplete stream" } as PreparedCheckpoint);
+  await job.promise;
+  assert.ok(job.diagnostics?.report.endsWith(report));
+  report = "MUTATED-AFTER-SETTLE";
+  assert.ok(job.refreshDiagnostics()?.report.endsWith("attempt=1 body=eof\nattempt=2 body=eof"));
+});
+
+test("a throwing optional diagnostic getter cannot change preparation outcome", async () => {
+  const h = fixture();
+  h.preparation.diagnostics = () => {
+    throw new Error("PRIVATE-CREDENTIAL");
+  };
+  const job = h.start();
+  assert.equal(job.refreshDiagnostics(), undefined);
+  h.resolve(h.handle);
+  assert.equal(await job.promise, h.handle);
+  assert.equal(job.state, "Ready");
+});
+
+test("progress checks never revalidate the potentially large engine snapshot", async () => {
+  const h = fixture();
+  let validations = 0;
+  h.preparation.isCurrent = () => {
+    validations++;
+    return true;
+  };
+  const job = h.start();
+  assert.equal(job.isProgressCurrent(), true);
+  assert.equal(job.isProgressCurrent(), true);
+  assert.equal(validations, 0);
+  h.settings.asyncThresholdPercent = 80;
+  assert.equal(job.isProgressCurrent(), false);
+  assert.equal(validations, 0);
+  h.resolve(h.handle);
+  await job.promise;
+});

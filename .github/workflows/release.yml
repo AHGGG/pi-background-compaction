@@ -46,12 +46,14 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: AHGGG/pi-extensions
-          ref: 59078a4a0dc58838a052ef1abcefb777415f878a
+          ref: 4ff480ecb21d145abfada8be0108903a035cfde2
           path: .integration-core
           persist-credentials: false
 
       - name: Test paired compaction engine
         run: npm run test:integration -- .integration-core
+        env:
+          REQUIRE_PREPARATION_DIAGNOSTICS: "1"
 
       - name: Inspect the npm package
         run: npm pack --dry-run
