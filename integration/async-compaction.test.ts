@@ -106,34 +106,42 @@ for (const event of [
     await h.emit("session_shutdown", {});
   });
 
-test("manual compaction cancels warmup and performs a fresh foreground request", async () => {
+test("manual compaction waits for warmup and adopts it without a fresh request", async () => {
   const h = fixture();
   await h.emit("session_start", {});
   await h.start();
   await h.started;
+  let settled = false;
+  const pending = h.compact("manual").finally(() => {
+    settled = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(h.fetches, 1);
+  assert.equal(h.requestSignals[0].aborted, false);
   h.release();
-  const result = await h.compact("manual");
+  const result = await pending;
   assert.ok(result && typeof result === "object" && "compaction" in result);
-  assert.equal(h.fetches, 2);
-  assert.equal(h.requestSignals[0].aborted, true);
+  assert.equal(h.fetches, 1);
   await h.emit("session_shutdown", {});
 });
 
-test("cancel while waiting never falls back or starts a duplicate request", async () => {
-  const h = fixture();
-  await h.emit("session_start", {});
-  await h.start();
-  await h.started;
-  const abort = new AbortController();
-  const result = h.compact("threshold", abort.signal);
-  abort.abort();
-  assert.deepEqual(await result, { cancel: true });
-  assert.equal(h.fetches, 1);
-  assert.equal(h.requestSignals[0].aborted, true);
-  assert.equal(h.notifications.length, 0);
-  h.release();
-  await h.emit("session_shutdown", {});
-});
+for (const reason of ["threshold", "manual"] as const)
+  test(`${reason} cancel while waiting never falls back or starts a duplicate request`, async () => {
+    const h = fixture();
+    await h.emit("session_start", {});
+    await h.start();
+    await h.started;
+    const abort = new AbortController();
+    const result = h.compact(reason, abort.signal);
+    abort.abort();
+    assert.deepEqual(await result, { cancel: true });
+    assert.equal(h.fetches, 1);
+    assert.equal(h.requestSignals[0].aborted, true);
+    assert.equal(h.notifications.length, 0);
+    h.release();
+    await h.emit("session_shutdown", {});
+  });
 
 test("failed background request tries foreground once before native fallback", async () => {
   const h = fixture();
@@ -641,19 +649,19 @@ for (const logCompaction of [false, true])
       await h.emit("session_shutdown", {});
     });
 
-test("logging identifies manual cancellation and fresh foreground work", async () => {
+test("logging identifies manual waiting and checkpoint reuse", async () => {
   const h = fixture({ logCompaction: true });
   await h.emit("session_start", {});
   await h.start();
   await h.started;
+  const pending = h.compact("manual");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(lifecycleLogs(h).join("\n"), /Actual compaction triggered \(manual\).*\n.*waiting for the in-flight/);
+  assert.equal(h.fetches, 1);
   h.release();
-  await h.compact("manual");
-  assert.match(lifecycleLogs(h).join("\n"), /Actual compaction triggered \(manual\).*\n.*Async compaction cancelled/);
-  assert.equal(h.fetches, 2);
-  assert.equal(
-    lifecycleLogs(h).some((line) => line.includes("reusing")),
-    false,
-  );
+  await pending;
+  assert.match(lifecycleLogs(h).join("\n"), /reusing the async checkpoint/);
+  assert.equal(h.fetches, 1);
   await h.emit("session_shutdown", {});
 });
 
@@ -791,5 +799,55 @@ test("plain manual compaction adopts ready Context Management once without conti
   assert.equal(h.fetches, 2, "a consumed ready checkpoint cannot be reused again");
   assert.equal(h.sentMessages.length, 0);
   assert.equal(h.sentUserMessages.length, 0);
+  await h.emit("session_shutdown", {});
+});
+
+test("manual waiting falls back to a fresh request after preparation fails", async () => {
+  const h = fixture({ maxRetries: 0 });
+  await h.emit("session_start", {});
+  h.failOnce();
+  await h.start();
+  await h.started;
+  const pending = h.compact("manual");
+  h.release();
+  const result = await pending;
+  assert.ok(result && typeof result === "object" && "compaction" in result);
+  assert.equal(h.fetches, 2);
+  await h.emit("session_shutdown", {});
+});
+
+for (const cancellation of ["resolve-race", "session-switch"] as const)
+  test(`manual wait ${cancellation} cannot apply or start a replacement request`, async () => {
+    const h = fixture();
+    await h.emit("session_start", {});
+    await h.start();
+    await h.started;
+    const abort = new AbortController();
+    const pending = h.compact("manual", abort.signal);
+    if (cancellation === "resolve-race") {
+      h.release();
+      abort.abort();
+    } else {
+      await h.emit("session_before_switch", {});
+      h.release();
+    }
+    assert.deepEqual(await pending, { cancel: true });
+    assert.equal(h.fetches, 1);
+    assert.equal(latestCheckpoint(h.manager.getBranch()), undefined);
+    await h.emit("session_shutdown", {});
+  });
+
+test("manual custom instructions replace pending preparation rather than waiting", async () => {
+  const h = fixture();
+  await h.emit("session_start", {});
+  await h.start();
+  await h.started;
+  const pending = h.compact("manual", undefined, "Preserve custom task details");
+  await vi.waitFor(() => assert.equal(h.fetches, 2));
+  assert.equal(h.requestSignals[0].aborted, true);
+  h.release();
+  const result = await pending;
+  assert.ok(result && typeof result === "object" && "compaction" in result);
+  assert.equal(h.fetches, 2);
   await h.emit("session_shutdown", {});
 });

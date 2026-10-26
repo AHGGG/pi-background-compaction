@@ -156,13 +156,7 @@ export function createBackgroundCompactionExtension(
         ctx,
         `Actual compaction triggered (${event.reason === "manual" ? "manual" : event.reason === "overflow" ? "overflow" : "threshold"}).`,
       );
-      if (event.customInstructions?.trim() || (event.reason === "manual" && owner.job?.state !== "Ready"))
-        cancelJob(
-          ctx,
-          event.customInstructions?.trim()
-            ? "foreground compaction has custom instructions"
-            : "manual compaction replaced unfinished preparation",
-        );
+      if (event.customInstructions?.trim()) cancelJob(ctx, "foreground compaction has custom instructions");
       const job = owner.job;
       const isCurrent = () =>
         owned(ctx, owner) &&

@@ -59,6 +59,8 @@ Completed turn → threshold reached → prepare in background
 
 The engine remains the sole owner of the foreground compaction hook and opaque checkpoint format.
 The companion chooses when to prepare and request application; it cannot bypass engine validation.
+
+Plain manual `/compact`, like threshold compaction, waits for compatible in-flight preparation and validates the result before adopting it. Escape cancels that wait without applying a checkpoint or starting a replacement request. Failed or invalid preparation uses the existing foreground path. Custom compaction instructions still replace background work because they require a different request. This applies only while preparation remains valid: if Pi aborts an active run before dispatching manual compaction, work owned by that run may already have been cancelled.
 A readiness notification is not a committed compaction. Success is confirmed from Pi's persisted checkpoint.
 A model-request failure keeps a valid ready checkpoint waiting until the next successful completed turn;
 it does not apply during retry/error settlement. A successful retry can then apply it once, with all

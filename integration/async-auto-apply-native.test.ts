@@ -73,7 +73,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-for (const boundary of ["settled", "input", "retry"] as const) {
+for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] as const) {
   test(`real Pi auto-apply at ${boundary}: commits once without extra inference or active abort`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-auto-apply-native-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -251,17 +251,50 @@ for (const boundary of ["settled", "input", "retry"] as const) {
         assert.equal(compactEvents, 0, "Ready completion alone must never compact");
       } else if (boundary === "settled") assert.equal(compactEvents, 1);
       else assert.equal(compactEvents, 0);
-      if (boundary !== "settled") await session.prompt("Second task");
+      if (boundary === "manual" || boundary === "manual-cancel") {
+        await maintenanceStarted.promise;
+        let finished = false;
+        const pending = session.compact().finally(() => {
+          finished = true;
+        });
+        // Baseline assertions can fail before awaiting; keep cleanup rejection observed.
+        void pending.catch(() => undefined);
+        for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
+        assert.equal(finished, false, "manual compaction must wait for the existing preparation");
+        assert.equal(remoteCalls, 1);
+        assert.equal(compactEvents, 0);
+        if (boundary === "manual-cancel") {
+          session.abortCompaction();
+          await assert.rejects(pending, /Compaction cancelled/);
+          releaseMaintenance.resolve();
+          for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
+          assert.equal(compactEvents, 0);
+          assert.equal(remoteCalls, 1);
+          assert.equal(workCalls, 1);
+          assert.equal(latestCheckpoint(manager.getBranch()), undefined);
+          return;
+        }
+        releaseMaintenance.resolve();
+        await pending;
+      } else if (boundary !== "settled") await session.prompt("Second task");
       assert.equal(compactEvents, 1);
       assert.equal(remoteCalls, 1);
       if (boundary === "retry") {
         assert.equal(retries, 1);
         assert.equal(successfulRetries, 1);
       }
-      assert.equal(workCalls, boundary === "retry" ? 3 : 2, "only work requests and the single Pi retry");
+      assert.equal(
+        workCalls,
+        boundary === "retry" ? 3 : boundary === "manual" ? 1 : 2,
+        "only requested work and the single Pi retry",
+      );
       assert.deepEqual(
         order,
-        boundary === "retry" ? ["work-1", "work-2", "work-3", "compacted"] : ["work-1", "compacted", "work-2"],
+        boundary === "retry"
+          ? ["work-1", "work-2", "work-3", "compacted"]
+          : boundary === "manual"
+            ? ["work-1", "compacted"]
+            : ["work-1", "compacted", "work-2"],
       );
       assert.ok(latestCheckpoint(manager.getBranch()));
       assert.equal(session.isIdle, true);
