@@ -20,10 +20,10 @@ export function compactionSettingsKey(settings: BackgroundCompactionSettings): s
 }
 
 export const DEFAULT_BACKGROUND_COMPACTION_SETTINGS: Readonly<BackgroundCompactionSettings> = Object.freeze({
-  asyncEnabled: false,
-  asyncAutoApply: false,
-  logCompaction: false,
-  asyncThresholdPercent: 65,
+  asyncEnabled: true,
+  asyncAutoApply: true,
+  logCompaction: true,
+  asyncThresholdPercent: 70,
 });
 
 export interface BackgroundCompactionSettingsState {
@@ -64,10 +64,22 @@ export function normalizeBackgroundCompactionSettings(value: unknown): Backgroun
   )
     return undefined;
   return {
-    asyncEnabled: typeof value.asyncEnabled === "boolean" ? value.asyncEnabled : false,
-    asyncAutoApply: typeof value.asyncAutoApply === "boolean" ? value.asyncAutoApply : false,
-    logCompaction: typeof value.logCompaction === "boolean" ? value.logCompaction : false,
-    asyncThresholdPercent: typeof value.asyncThresholdPercent === "number" ? value.asyncThresholdPercent : 65,
+    asyncEnabled:
+      typeof value.asyncEnabled === "boolean"
+        ? value.asyncEnabled
+        : DEFAULT_BACKGROUND_COMPACTION_SETTINGS.asyncEnabled,
+    asyncAutoApply:
+      typeof value.asyncAutoApply === "boolean"
+        ? value.asyncAutoApply
+        : DEFAULT_BACKGROUND_COMPACTION_SETTINGS.asyncAutoApply,
+    logCompaction:
+      typeof value.logCompaction === "boolean"
+        ? value.logCompaction
+        : DEFAULT_BACKGROUND_COMPACTION_SETTINGS.logCompaction,
+    asyncThresholdPercent:
+      typeof value.asyncThresholdPercent === "number"
+        ? value.asyncThresholdPercent
+        : DEFAULT_BACKGROUND_COMPACTION_SETTINGS.asyncThresholdPercent,
   };
 }
 
@@ -114,7 +126,8 @@ async function loadSingleSettings(
     return {
       kind: "invalid",
       path,
-      settings: { ...DEFAULT_BACKGROUND_COMPACTION_SETTINGS },
+      // Unreadable preferences must never implicitly authorize provider work.
+      settings: { ...DEFAULT_BACKGROUND_COMPACTION_SETTINGS, asyncEnabled: false, asyncAutoApply: false },
       issue:
         isNodeError(error) && error.code === "ELOOP"
           ? "symbolic links are not accepted"
@@ -139,6 +152,7 @@ export async function loadBackgroundCompactionSettings(
     return {
       ...canonical,
       kind: "invalid",
+      settings: legacy.settings,
       source: "legacy",
       legacyPath,
       issue: `Legacy settings could not be read: ${legacy.issue ?? "invalid settings"}`,

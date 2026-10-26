@@ -72,7 +72,11 @@ export function fixture(overrides = {}, order: "core-first" | "background-first"
     settings: {
       ...DEFAULT_CODEX_COMPACT_SETTINGS,
       ...DEFAULT_BACKGROUND_COMPACTION_SETTINGS,
+      // These cases exercise the original opt-in configuration explicitly.
       asyncEnabled: true,
+      asyncAutoApply: false,
+      logCompaction: false,
+      asyncThresholdPercent: 65,
       ...overrides,
     },
     document: {},

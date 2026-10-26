@@ -2,11 +2,11 @@
 
 Prepare a compaction checkpoint in the background while Pi continues working. When compaction is needed, Pi can reuse that checkpoint instead of starting from scratch.
 
-This is an optional companion to a compatible compaction engine, such as [pi-codex-compact](https://github.com/AHGGG/pi-extensions/tree/main/packages/pi-codex-compact). The companion decides when to prepare and apply a checkpoint. The engine handles provider requests, checkpoint validation, and recovery.
-
-Background preparation is experimental and off by default. It may consume provider quota even if the checkpoint is never used. It can reduce waiting, but does not guarantee faster or cheaper compaction.
+Background preparation and automatic application are on by default. It may consume provider quota even if the checkpoint is never used. It can reduce waiting, but does not guarantee faster or cheaper compaction.
 
 ## Install
+
+This is an optional companion to a compatible compaction engine, such as [pi-codex-compact](https://github.com/AHGGG/pi-extensions/tree/main/packages/pi-codex-compact). The companion decides when to prepare and apply a checkpoint. The engine handles provider requests, checkpoint validation, and recovery.
 
 1. Install or update a compatible compaction engine. Follow the [pi-codex-compact setup instructions](https://github.com/AHGGG/pi-extensions/tree/main/packages/pi-codex-compact) and keep its extension enabled.
 2. Install this companion:
@@ -23,14 +23,14 @@ Removing this companion does not remove the engine's manual compaction or checkp
 
 ## Get started
 
-Run `/background-compaction`, open **Settings**, and turn on **Background preparation**.
+After installation, background preparation, **Apply when ready**, and progress notices are enabled by default. Run `/background-compaction` and open **Settings** to change them.
 
-After a completed turn, preparation can start when context usage reaches the configured threshold, which defaults to 65%. You can keep working while it runs.
+After a completed turn, preparation can start when context usage reaches the configured threshold, which defaults to 70%. You can keep working while it runs.
 
 There are two ways to use a prepared checkpoint:
 
-- **Leave Apply when ready off:** the checkpoint waits for manual `/compact` or Pi's automatic compaction.
-- **Turn Apply when ready on:** the extension can apply it after the current model/tool batch or at the next idle input boundary, once validation succeeds.
+- **Turn Apply when ready off:** the checkpoint waits for manual `/compact` or Pi's automatic compaction.
+- **Leave Apply when ready on (default):** the extension can apply it after the current model/tool batch or at the next idle input boundary, once validation succeeds.
 
 A **Ready** checkpoint has been prepared, not yet written into the session. Changes to the session, model, provider, tools, or relevant settings can make it unusable. The engine checks it before applying it.
 
@@ -60,12 +60,12 @@ Settings are stored in `pi-background-compaction.json` inside Pi's agent directo
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `asyncEnabled` | `false` | Allow background checkpoint preparation. |
-| `asyncAutoApply` | `false` | Apply ready checkpoints without waiting for ordinary compaction. Requires background preparation to be enabled. |
-| `asyncThresholdPercent` | `65` | Context usage percentage that allows preparation. Must be an integer from 1 to 99. |
-| `logCompaction` | `false` | Show preparation and application notices. |
+| `asyncEnabled` | `true` | Allow background checkpoint preparation. |
+| `asyncAutoApply` | `true` | Apply ready checkpoints without waiting for ordinary compaction. Requires background preparation to be enabled. |
+| `asyncThresholdPercent` | `70` | Context usage percentage that allows preparation. Must be an integer from 1 to 99. |
+| `logCompaction` | `true` | Show preparation and application notices. |
 
-Menu changes are saved and take effect immediately. Escape closes the menu; it does not undo saved changes. If you edit the file yourself, run `/reload` to load it. Invalid settings files are not overwritten; repair the file and reload.
+Menu changes are saved and take effect immediately. Escape closes the menu; it does not undo saved changes. If you edit the file yourself, run `/reload` to load it. Invalid settings files disable background preparation and are not overwritten; repair the file and reload.
 
 These are user-level settings, with no project overrides. Provider timeouts, retries, checkpoint retention, and recovery options belong to the compaction engine, not this companion.
 
@@ -75,7 +75,7 @@ Background settings and the resume command have moved from `/codex-compact` to `
 
 If the new settings file does not exist, this extension reads the four settings above from the adjacent `pi-codex-compact.json`. Status shows when those legacy preferences are in use. The first explicit save in the new menu copies them into the new file, without changing the old file or copying provider credentials.
 
-Once the new file exists, it takes precedence. Missing fields use the defaults above, not values from the old file. Keep your old settings until you have saved the new ones.
+Once the new file exists, it takes precedence. Explicit saved values, including `false` and older thresholds, are preserved. Missing fields in either file use the defaults above; missing fields in the new file do not fall back to the old file. Keep your old settings until you have saved the new ones.
 
 ## Failures and limits
 

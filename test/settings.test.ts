@@ -27,7 +27,13 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-test("defaults remain opt-in and validation accepts only bounded fields", () => {
+test("defaults enable preparation, application and notices at 70%; validation remains bounded", () => {
+  assert.deepEqual(DEFAULT_BACKGROUND_COMPACTION_SETTINGS, {
+    asyncEnabled: true,
+    asyncAutoApply: true,
+    logCompaction: true,
+    asyncThresholdPercent: 70,
+  });
   assert.deepEqual(normalizeBackgroundCompactionSettings({}), DEFAULT_BACKGROUND_COMPACTION_SETTINGS);
   for (const field of ["asyncEnabled", "asyncAutoApply", "logCompaction"]) {
     for (const value of [null, "true", 0, {}, []])
@@ -45,9 +51,9 @@ test("log and automatic-application toggles do not invalidate prepared work", ()
   const settings = { ...DEFAULT_BACKGROUND_COMPACTION_SETTINGS };
   assert.equal(
     compactionSettingsKey(settings),
-    compactionSettingsKey({ ...settings, logCompaction: true, asyncAutoApply: true }),
+    compactionSettingsKey({ ...settings, logCompaction: false, asyncAutoApply: false }),
   );
-  assert.notEqual(compactionSettingsKey(settings), compactionSettingsKey({ ...settings, asyncEnabled: true }));
+  assert.notEqual(compactionSettingsKey(settings), compactionSettingsKey({ ...settings, asyncEnabled: false }));
   assert.notEqual(compactionSettingsKey(settings), compactionSettingsKey({ ...settings, asyncThresholdPercent: 75 }));
 });
 
@@ -56,6 +62,7 @@ test("missing-file load is side-effect free, including a missing parent director
   const loaded = await loadBackgroundCompactionSettings(path);
   assert.equal(loaded.kind, "missing");
   assert.equal(loaded.source, "defaults");
+  assert.deepEqual(loaded.settings, DEFAULT_BACKGROUND_COMPACTION_SETTINGS);
   await assert.rejects(stat(dirname(path)), { code: "ENOENT" });
 });
 
@@ -99,22 +106,26 @@ test("canonical file wins entirely over legacy preferences, including explicit f
   const loaded = await loadBackgroundCompactionSettings(path);
   assert.equal(loaded.source, "canonical");
   assert.equal(loaded.settings.asyncEnabled, false);
-  assert.equal(loaded.settings.asyncAutoApply, false);
+  assert.equal(loaded.settings.asyncAutoApply, true);
 });
 
-test("invalid canonical never falls back, invalid legacy blocks implicit opt-in loss", async () => {
+test("invalid canonical never falls back; invalid canonical and legacy both disable preparation", async () => {
   const path = await settingsPath();
   const legacy = join(dirname(path), "pi-codex-compact.json");
   await writeFile(legacy, '{"asyncEnabled":true}');
   await writeFile(path, "{invalid");
   const runtime = createBackgroundCompactionSettingsRuntime(path);
   assert.equal((await runtime.reload()).kind, "invalid");
+  assert.equal(runtime.get().settings.asyncEnabled, false);
+  assert.equal(runtime.get().settings.asyncAutoApply, false);
   await assert.rejects(runtime.update({ logCompaction: true }), /Cannot overwrite/);
   assert.equal(await readFile(path, "utf8"), "{invalid");
   await rm(path);
   await writeFile(legacy, '{"asyncEnabled":"bad"}');
   assert.equal((await runtime.reload()).source, "legacy");
   assert.equal(runtime.get().kind, "invalid");
+  assert.equal(runtime.get().settings.asyncEnabled, false);
+  assert.equal(runtime.get().settings.asyncAutoApply, false);
   await assert.rejects(runtime.update({ logCompaction: true }), /Cannot overwrite/);
   await assert.rejects(stat(path), { code: "ENOENT" });
 });
@@ -192,3 +203,27 @@ test("atomic publication failure leaves the prior document and runtime intact", 
   await runtime.update({ logCompaction: true });
   assert.equal(runtime.get().settings.logCompaction, true);
 });
+
+for (const source of ["canonical", "legacy"] as const) {
+  test(`${source} preserves saved off values and old threshold; missing fields use current defaults`, async () => {
+    const path = await settingsPath();
+    const input = source === "canonical" ? path : join(dirname(path), "pi-codex-compact.json");
+    const saved = { asyncEnabled: false, asyncAutoApply: false, logCompaction: false, asyncThresholdPercent: 65 };
+    await writeFile(input, JSON.stringify(saved));
+    const runtime = createBackgroundCompactionSettingsRuntime(path);
+    assert.deepEqual((await runtime.reload()).settings, saved);
+    await runtime.update({ logCompaction: true });
+    assert.deepEqual(runtime.get().settings, { ...saved, logCompaction: true });
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { ...saved, logCompaction: true });
+    if (source === "legacy") {
+      assert.deepEqual(JSON.parse(await readFile(input, "utf8")), saved);
+      await rm(path);
+    }
+    await writeFile(input, JSON.stringify({ asyncEnabled: false }));
+    assert.deepEqual((await runtime.reload()).settings, {
+      ...DEFAULT_BACKGROUND_COMPACTION_SETTINGS,
+      asyncEnabled: false,
+    });
+    assert.deepEqual(JSON.parse(await readFile(input, "utf8")), { asyncEnabled: false });
+  });
+}

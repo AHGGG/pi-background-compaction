@@ -118,7 +118,7 @@ for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] 
                 for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
                 throw new Error("ChatGPT WebSocket closed (closed_before_completion); no HTTP replay performed");
               }
-              return textResponse("Work completed", workCalls === 1 ? 65_000 : 10);
+              return textResponse("Work completed", workCalls === 1 ? 70_000 : 10);
             },
           }),
       });
@@ -131,8 +131,6 @@ for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] 
           ...DEFAULT_BACKGROUND_COMPACTION_SETTINGS,
           protocol: "context-management" as const,
           maxRetries: 0,
-          asyncEnabled: true,
-          asyncAutoApply: true,
         },
       };
       const settingsManager = SettingsManager.inMemory({

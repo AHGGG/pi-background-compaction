@@ -41,9 +41,6 @@ function fixture(order: "first" | "last" | "absent" = "first") {
   } as unknown as ExtensionAPI;
   const settings = {
     ...DEFAULT_BACKGROUND_COMPACTION_SETTINGS,
-    asyncEnabled: true,
-    asyncAutoApply: true,
-    logCompaction: true,
   };
   const state = { kind: "loaded" as const, path: "fixture.json", settings };
   const runtime = {
@@ -188,6 +185,33 @@ test("absent engine remains passive and explains enabled-but-unavailable state",
   await h.turn();
   assert.equal(h.starts, 0);
   assert.ok(h.notices.some((message) => message.includes("no compatible compaction engine")));
+  await h.emit("session_shutdown");
+});
+
+test("default threshold starts at 70%, not below, without an enable step", async () => {
+  const h = fixture();
+  await h.emit("session_start");
+  h.ctx.getContextUsage = () => ({ tokens: 69, contextWindow: 100, percent: 69 });
+  await h.turn();
+  assert.equal(h.starts, 0);
+  h.ctx.getContextUsage = () => ({ tokens: 70, contextWindow: 100, percent: 70 });
+  await h.turn();
+  await drain();
+  assert.equal(h.starts, 1);
+  assert.ok(h.notices.some((message) => message.includes("Async compaction")));
+  await h.emit("session_shutdown");
+});
+
+test("saved Off and an unavailable engine prevent preparation with on-by-default settings", async () => {
+  const h = fixture();
+  h.settings.asyncEnabled = false;
+  await h.emit("session_start");
+  await h.turn();
+  assert.equal(h.starts, 0);
+  h.settings.asyncEnabled = true;
+  h.engine.available = () => false;
+  await h.turn();
+  assert.equal(h.starts, 0);
   await h.emit("session_shutdown");
 });
 

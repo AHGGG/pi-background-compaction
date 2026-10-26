@@ -376,7 +376,7 @@ export function createBackgroundCompactionExtension(
         if (!owned(ctx, owner)) return;
         if (ctx.hasUI && state.kind === "invalid")
           ctx.ui.notify(
-            `Invalid pi-background-compaction.json; using defaults without overwriting it. ${terminalText(state.issue ?? "unknown validation error")}`,
+            `Invalid background compaction settings; background preparation is disabled without overwriting the file. ${terminalText(state.issue ?? "unknown validation error")}`,
             "warning",
           );
         if (ctx.hasUI && state.source === "legacy")

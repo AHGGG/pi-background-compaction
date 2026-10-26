@@ -72,6 +72,10 @@ test("main menu has Settings, Status and Help; pause and legacy source remain vi
   assert.equal(settings.kind, "settings");
   if (settings.kind !== "settings") assert.fail("expected settings");
   assert.deepEqual(
+    settings.items.map((item) => item.currentValue),
+    ["On", "On", "70%", "On"],
+  );
+  assert.deepEqual(
     settings.items.map((item) => item.id),
     ["asyncEnabled", "asyncAutoApply", "asyncThresholdPercent", "logCompaction"],
   );
@@ -124,10 +128,10 @@ test("failed save reports failure and does not invalidate work", async () => {
     state: runtime.get(),
     signal: new AbortController().signal,
     itemId: "asyncEnabled",
-    value: "On",
+    value: "Off",
   });
   assert.deepEqual(result, { kind: "rejected" });
-  assert.equal(runtime.get().settings.asyncEnabled, false);
+  assert.equal(runtime.get().settings.asyncEnabled, true);
   assert.equal(changes, 0);
   assert.match(notices.join("\n"), /disk full/);
 });
@@ -219,13 +223,13 @@ test("TUI framing remains bounded and focused settings survive resize", async ()
   assert.match(normal.at(-1) ?? "", /^─+$/);
   assert.match(normal.join("\n"), /Background preparation/);
   assert.ok(constrained.length <= 5);
-  assert.match(constrained.join("\n"), /Preparation threshold.*70%/);
+  assert.match(constrained.join("\n"), /Preparation threshold.*75%/);
   for (const { width, lines } of resized) {
     assert.ok(lines.length <= 1);
     assert.ok(lines.every((line) => visibleWidth(line) <= Math.max(1, width)));
   }
   assert.equal(changes, 2);
-  assert.deepEqual(patches, [{ asyncEnabled: true }, { asyncThresholdPercent: 70 }]);
+  assert.deepEqual(patches, [{ asyncEnabled: false }, { asyncThresholdPercent: 75 }]);
 });
 
 test("invalidation waits for durable save and failed save leaves displayed value unchanged", async () => {
