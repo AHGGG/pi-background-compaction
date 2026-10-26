@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/AHGGG/pi-background-compaction/compare/v0.2.0...v0.2.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* report background preparation failures with actionable diagnostics ([cf07e27](https://github.com/AHGGG/pi-background-compaction/commit/cf07e27ec4c8daac8b9dc1b81d23ecdc40653d8c))
+
 ## [0.2.0](https://github.com/AHGGG/pi-background-compaction/compare/v0.1.0...v0.2.0) (2026-10-26)
 
 
