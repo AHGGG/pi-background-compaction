@@ -60,6 +60,9 @@ Completed turn → threshold reached → prepare in background
 The engine remains the sole owner of the foreground compaction hook and opaque checkpoint format.
 The companion chooses when to prepare and request application; it cannot bypass engine validation.
 A readiness notification is not a committed compaction. Success is confirmed from Pi's persisted checkpoint.
+A model-request failure keeps a valid ready checkpoint waiting until the next successful completed turn;
+it does not apply during retry/error settlement. A successful retry can then apply it once, with all
+normal validity checks. Explicit cancellation still leaves ready work for manual `/compact`, not automatic application.
 
 ## 💬 Commands
 

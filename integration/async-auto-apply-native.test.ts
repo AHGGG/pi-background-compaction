@@ -73,7 +73,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-for (const boundary of ["settled", "input"] as const) {
+for (const boundary of ["settled", "input", "retry"] as const) {
   test(`real Pi auto-apply at ${boundary}: commits once without extra inference or active abort`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-auto-apply-native-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -111,6 +111,13 @@ for (const boundary of ["settled", "input"] as const) {
               workCalls += 1;
               order.push(`work-${workCalls}`);
               if (init?.signal) workSignals.push(init.signal);
+              if (boundary === "retry" && workCalls === 2) {
+                await maintenanceStarted.promise;
+                releaseMaintenance.resolve();
+                // Let the prepared result settle while this model request is active.
+                for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
+                throw new Error("ChatGPT WebSocket closed (closed_before_completion); no HTTP replay performed");
+              }
               return textResponse("Work completed", workCalls === 1 ? 65_000 : 10);
             },
           }),
@@ -130,7 +137,7 @@ for (const boundary of ["settled", "input"] as const) {
       };
       const settingsManager = SettingsManager.inMemory({
         compaction: { enabled: true, reserveTokens: 15_000, keepRecentTokens: 150 },
-        retry: { enabled: false },
+        retry: { enabled: boundary === "retry", maxRetries: 1, baseDelayMs: 1 },
       });
       const observer = (pi: ExtensionAPI) => {
         // The warm request starts at turn_end; hold settlement to cover a Ready result there.
@@ -152,7 +159,7 @@ for (const boundary of ["settled", "input"] as const) {
         });
         pi.on("session_compact", (event) => {
           compactEvents += 1;
-          assert.equal(event.reason, "manual");
+          assert.equal(event.reason, boundary === "retry" ? "threshold" : "manual");
           assert.equal(event.fromExtension, true);
           order.push("compacted");
         });
@@ -221,6 +228,20 @@ for (const boundary of ["settled", "input"] as const) {
         noTools: "all",
       }));
       await session.bindExtensions({ mode: "print" });
+      let retries = 0;
+      let successfulRetries = 0;
+      session.subscribe((event) => {
+        if (boundary !== "retry") return;
+        if (event.type === "auto_retry_start") {
+          retries += 1;
+          assert.equal(latestCheckpoint(manager.getBranch()), undefined);
+        }
+        if (event.type === "auto_retry_end" && event.success) successfulRetries += 1;
+        if (event.type === "entry_appended" && event.entry.type === "compaction") {
+          compactEvents += 1;
+          order.push("compacted");
+        }
+      });
       await session.prompt("First task");
       if (boundary === "input") {
         assert.equal(compactEvents, 0);
@@ -228,12 +249,20 @@ for (const boundary of ["settled", "input"] as const) {
         releaseMaintenance.resolve();
         for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
         assert.equal(compactEvents, 0, "Ready completion alone must never compact");
-      } else assert.equal(compactEvents, 1);
-      if (boundary === "input") await session.prompt("Second task");
+      } else if (boundary === "settled") assert.equal(compactEvents, 1);
+      else assert.equal(compactEvents, 0);
+      if (boundary !== "settled") await session.prompt("Second task");
       assert.equal(compactEvents, 1);
       assert.equal(remoteCalls, 1);
-      assert.equal(workCalls, 2, "no synthetic continuation or native summarizer");
-      assert.deepEqual(order, ["work-1", "compacted", "work-2"]);
+      if (boundary === "retry") {
+        assert.equal(retries, 1);
+        assert.equal(successfulRetries, 1);
+      }
+      assert.equal(workCalls, boundary === "retry" ? 3 : 2, "only work requests and the single Pi retry");
+      assert.deepEqual(
+        order,
+        boundary === "retry" ? ["work-1", "work-2", "work-3", "compacted"] : ["work-1", "compacted", "work-2"],
+      );
       assert.ok(latestCheckpoint(manager.getBranch()));
       assert.equal(session.isIdle, true);
       assert.ok(workSignals.every((signal) => !signal.aborted));

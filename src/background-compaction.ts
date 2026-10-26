@@ -49,6 +49,9 @@ export function createBackgroundCompactionExtension(
     const owners = new WeakMap<object, Owner>();
     const activeManagers = new Set<object>();
     const attempted = new WeakSet<BackgroundJob>();
+    // A model failure is not an application attempt. Wait for a successful
+    // turn before re-enabling automatic application, including at idle input.
+    const awaitingCompletedTurn = new WeakSet<BackgroundJob>();
     let engine: CompactionEngineV1 | undefined;
     let detachSource: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined;
@@ -285,7 +288,8 @@ export function createBackgroundCompactionExtension(
         !engine?.available(ctx) ||
         !ctx.isIdle() ||
         ctx.hasPendingMessages() ||
-        attempted.has(job)
+        attempted.has(job) ||
+        awaitingCompletedTurn.has(job)
       )
         return;
       attempted.add(job);
@@ -405,10 +409,14 @@ export function createBackgroundCompactionExtension(
       confirmBoundary(ctx);
       const owner = ownerFor(ctx);
       if (event.outcome !== "completed" || ctx.signal?.aborted) {
-        stopPreparation(ctx);
+        const job = owner.job;
+        if (event.outcome === "error" && !ctx.signal?.aborted && job?.state === "Ready" && job.isCurrent())
+          awaitingCompletedTurn.add(job);
+        else stopPreparation(ctx);
         return;
       }
       const previous = owner.job;
+      if (previous) awaitingCompletedTurn.delete(previous);
       const timings =
         previous?.state === "Ready" && ctx.hasUI && runtime.get().settings.logCompaction
           ? new CompactionTimings()

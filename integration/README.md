@@ -24,7 +24,8 @@ suite uses Pi's real session runner with a local mocked provider transport.
 | `async-failure-pause` | Failure versus invalidation, explicit resume, late callbacks, pause lifecycle |
 | `auto-apply` | Idle input/settlement claims, cancellation, retry suppression, no extra inference |
 | `midrun-auto-apply` | Serialized tool-batch drafts, exact ancestry, retained ready work, commit confirmation |
-| `async-auto-apply-native` | Actual Pi session input and settlement application without aborting active work |
+| `ready-after-retry` | Model-error deferral, successful retry, manual reuse, abort and one-attempt guards |
+| `async-auto-apply-native` | Actual Pi session input, settlement and successful model-retry application without aborting active work |
 | `engine-contract` | Both installation orders and core-alone foreground behavior |
 
 The first eight suites were extracted from `pi-codex-compact` at commit
