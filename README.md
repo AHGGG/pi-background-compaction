@@ -1,137 +1,112 @@
-# 🌙 pi-background-compaction
+# pi-background-compaction
 
-[![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://github.com/earendil-works/pi)
-[![Install from Git](https://img.shields.io/badge/install-Git-blue)](https://github.com/AHGGG/pi-background-compaction)
-[![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+Prepare a compaction checkpoint in the background while Pi continues working. When compaction is needed, Pi can reuse that checkpoint instead of starting from scratch.
 
-Prepare a compaction checkpoint while Pi continues working, then apply it at a safe boundary.
-This optional extension owns background scheduling, settings and UI; a compatible compaction engine owns provider requests and checkpoint validation.
+This is an optional companion to a compatible compaction engine, such as [pi-codex-compact](https://github.com/AHGGG/pi-extensions/tree/main/packages/pi-codex-compact). The companion decides when to prepare and apply a checkpoint. The engine handles provider requests, checkpoint validation, and recovery.
 
-## ✨ Features
+Background preparation is experimental and off by default. It may consume provider quota even if the checkpoint is never used. It can reduce waiting, but does not guarantee faster or cheaper compaction.
 
-- Start preparation after a completed turn when context usage reaches your chosen threshold.
-- Reuse prepared work for compaction, with optional automatic application after a model/tool batch or at an idle boundary.
-- Cancel stale work on session, model or settings changes; pause on genuine preparation/application failures.
-- Preserve existing background preferences from `pi-codex-compact.json` without rewriting that file.
+## Install
 
-## 📦 Install
+1. Install or update a compatible compaction engine. Follow the [pi-codex-compact setup instructions](https://github.com/AHGGG/pi-extensions/tree/main/packages/pi-codex-compact) and keep its extension enabled.
+2. Install this companion:
 
-This is a Git-distributed package, not an npm release. Extensions run with Pi's permissions: install only code you trust.
-Background preparation is experimental and can consume provider quota even if its result is never used.
+   ```sh
+   pi install git:github.com/AHGGG/pi-background-compaction@master
+   ```
 
-Update the compatible engine in [AHGGG/pi-extensions](https://github.com/AHGGG/pi-extensions/tree/main/packages/pi-codex-compact), then install this companion:
+3. Restart Pi.
 
-```sh
-pi install git:github.com/AHGGG/pi-background-compaction@master
-```
+Use a current engine version that supports the separate background companion. Do not run an older built-in background controller alongside this extension. If Pi reports that no compatible engine is installed, update the engine and restart; this package cannot prepare checkpoints on its own.
 
-Keep `packages/pi-codex-compact/src/index.ts` enabled in your `pi-extensions` package selection and add this package separately.
-Do not enable the old built-in background controller alongside this companion: update both packages, then restart Pi.
-A missing or incompatible engine does not trigger preparation; this package does not contain a second compaction engine.
+Removing this companion does not remove the engine's manual compaction or checkpoint replay features.
 
-For a local checkout, install dependencies before loading the source entrypoint; no generated build is required:
+## Get started
+
+Run `/background-compaction`, open **Settings**, and turn on **Background preparation**.
+
+After a completed turn, preparation can start when context usage reaches the configured threshold, which defaults to 65%. You can keep working while it runs.
+
+There are two ways to use a prepared checkpoint:
+
+- **Leave Apply when ready off:** the checkpoint waits for manual `/compact` or Pi's automatic compaction.
+- **Turn Apply when ready on:** the extension can apply it after the current model/tool batch or at the next idle input boundary, once validation succeeds.
+
+A **Ready** checkpoint has been prepared, not yet written into the session. Changes to the session, model, provider, tools, or relevant settings can make it unusable. The engine checks it before applying it.
+
+## Manual and automatic compaction
+
+If a compatible checkpoint is still being prepared, plain `/compact` waits for it, just as Pi's automatic compaction does. A **Preparing** status during this wait is expected. If preparation or validation fails, the engine handles compaction in the foreground instead.
+
+- Press Escape to cancel the wait. Cancellation does not apply the checkpoint or start a replacement request.
+- Custom instructions passed to `/compact` replace the pending background work so the new instructions are respected.
+- If the Pi host cancels an active run before dispatching `/compact`, work already cancelled by that action cannot be reused.
+
+With **Apply when ready** enabled, a ready checkpoint is not applied during a failed model request or its retry. After a successful completed turn, it can be applied if it is still valid. Explicit cancellation prevents automatic application of that checkpoint; manual `/compact` remains available.
+
+## Commands
+
+| Command | Action |
+| --- | --- |
+| `/background-compaction` | Open Settings, Status, and Help in the terminal UI. |
+| `/background-compaction resume` | Clear a failure pause for this session. Preparation can start after the next completed turn. |
+| `/compact` | Run Pi's compaction, reusing compatible background work when available. |
+
+In RPC mode with UI support, `/background-compaction` reports the settings file path instead of opening a menu. The menu is not available in print or JSON mode. The `resume` command does not require the menu.
+
+## Settings
+
+Settings are stored in `pi-background-compaction.json` inside Pi's agent directory, normally `~/.pi/agent/pi-background-compaction.json`.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `asyncEnabled` | `false` | Allow background checkpoint preparation. |
+| `asyncAutoApply` | `false` | Apply ready checkpoints without waiting for ordinary compaction. Requires background preparation to be enabled. |
+| `asyncThresholdPercent` | `65` | Context usage percentage that allows preparation. Must be an integer from 1 to 99. |
+| `logCompaction` | `false` | Show preparation and application notices. |
+
+Menu changes are saved and take effect immediately. Escape closes the menu; it does not undo saved changes. If you edit the file yourself, run `/reload` to load it. Invalid settings files are not overwritten; repair the file and reload.
+
+These are user-level settings, with no project overrides. Provider timeouts, retries, checkpoint retention, and recovery options belong to the compaction engine, not this companion.
+
+### Moving from the built-in controller
+
+Background settings and the resume command have moved from `/codex-compact` to `/background-compaction`.
+
+If the new settings file does not exist, this extension reads the four settings above from the adjacent `pi-codex-compact.json`. Status shows when those legacy preferences are in use. The first explicit save in the new menu copies them into the new file, without changing the old file or copying provider credentials.
+
+Once the new file exists, it takes precedence. Missing fields use the defaults above, not values from the old file. Keep your old settings until you have saved the new ones.
+
+## Failures and limits
+
+A failed preparation request pauses further preparation for the current session. Preparation failure warnings include elapsed time and a safe reason from the engine, or a generic message if no safe reason is available. Manual `/compact` and Pi's automatic compaction remain available.
+
+Use `/background-compaction resume` when you want to try background preparation again. This clears the pause; it does not immediately send a provider request.
+
+A checkpoint can also be discarded because the session changed or it no longer fits. Discarding an outdated checkpoint is not the same as a provider failure. Automatic application will not silently send a new provider request to replace an invalid checkpoint.
+
+This extension does not add provider support or credentials. Requests use the compatible engine's existing provider route and authentication. Install only extensions and engines you trust. Check the engine's documentation for its data handling, supported providers, and recovery behavior.
+
+## Development
 
 ```sh
 npm install
+npm run check
+npm test
+```
+
+Run integration tests against a local, compatible `pi-extensions` checkout:
+
+```sh
+npm run test:integration -- /path/to/pi-extensions
+```
+
+To load the local extension in Pi:
+
+```sh
 pi -e ./src/index.ts
 ```
 
-The companion can be removed without removing manual compaction or the engine's saved-checkpoint replay support.
+## License
 
-## 🚀 Quick start
-
-1. Restart Pi after updating the engine and installing the companion.
-2. Open `/background-compaction`, then **Settings**.
-3. Enable **Background preparation**. Enable **Apply when ready** separately if desired.
-
-Previously saved opt-ins are inherited automatically when the new settings file does not exist.
-Use **Status** to see whether the current preferences came from the legacy file.
-
-## 🧭 How it works
-
-```text
-Completed turn → threshold reached → prepare in background
-                                           ↓
-                                    checkpoint ready
-                                           ↓
-                     safe Pi boundary → engine validates → Pi commits
-```
-
-The engine remains the sole owner of the foreground compaction hook and opaque checkpoint format.
-The companion chooses when to prepare and request application; it cannot bypass engine validation.
-
-Plain manual `/compact`, like threshold compaction, waits for compatible in-flight preparation and validates the result before adopting it. Escape cancels that wait without applying a checkpoint or starting a replacement request. Failed or invalid preparation uses the existing foreground path. Custom compaction instructions still replace background work because they require a different request. This applies only while preparation remains valid: if Pi aborts an active run before dispatching manual compaction, work owned by that run may already have been cancelled.
-A readiness notification is not a committed compaction. Success is confirmed from Pi's persisted checkpoint.
-A model-request failure keeps a valid ready checkpoint waiting until the next successful completed turn;
-it does not apply during retry/error settlement. A successful retry can then apply it once, with all
-normal validity checks. Explicit cancellation still leaves ready work for manual `/compact`, not automatic application.
-
-## 💬 Commands
-
-- `/background-compaction` opens Settings, Status and Help in TUI mode; in RPC it reports the settings path.
-- `/background-compaction resume` clears the session-only failure pause so preparation can start after the next completed turn. It performs this direct operation in all modes without opening interactive UI.
-
-Unknown or trailing arguments are rejected. The interactive menu is unavailable in print/JSON mode.
-Manual `/compact` remains an engine/Pi operation, not a separate implementation in this package.
-
-## ⚙️ Settings
-
-User settings live at `<getAgentDir()>/pi-background-compaction.json` (normally `~/.pi/agent/pi-background-compaction.json`).
-There are no project overrides or extension-specific environment variables.
-Settings reload at session start, including `/reload`; menu changes apply immediately after a successful save.
-Escape closes the menu without undoing changes already saved.
-
-| Field | Default | Accepted values |
-| --- | --- | --- |
-| `asyncEnabled` | `false` | Boolean; opt in to preparation |
-| `asyncAutoApply` | `false` | Boolean; apply ready work automatically |
-| `asyncThresholdPercent` | `65` | Integer from 1 to 99 |
-| `logCompaction` | `false` | Boolean; show lifecycle notices |
-
-Request timeout, provider protocol, retry policy and checkpoint retention remain engine settings.
-
-### Migration and persistence
-
-If you previously used background controls inside `/codex-compact`, use `/background-compaction` for those controls and `/background-compaction resume` to clear a failure pause. Do not rely on `/codex-compact resume`: the engine does not own the companion's commands. `/codex-compact` still controls the engine's foreground compaction settings.
-
-When the new file is absent, the companion reads only the four fields above from the adjacent `pi-codex-compact.json`.
-It never changes or removes that legacy file. Do not delete the four legacy background fields before saving your preferences in the new menu. The first explicit save writes the inherited background preferences plus your change to the new file, without copying provider/authentication settings.
-If both files exist, the new file wins entirely; missing fields use defaults rather than legacy values.
-
-A missing file causes no filesystem writes. Invalid files are reported and block saving until repaired, rather than being overwritten with defaults.
-Unknown fields in the new file are preserved. Saves use a private temporary file followed by rename and are ordered within this process; this is not a cross-process locking guarantee.
-Failed saves keep the previous effective preferences.
-
-## 🔒 Security and privacy
-
-Preparation sends session context through the installed engine's existing provider route and authentication.
-This package does not store credentials or make independent provider requests.
-Preparation failures show the engine’s safe diagnostic summary and elapsed preparation time.
-Protocol producers must filter diagnostics before returning them: never include credentials, headers, request/response bodies, conversation content, checkpoint contents or stacks.
-The companion bounds and cleans these summaries for terminal display; unexpected rejected errors are reported generically rather than exposing their raw messages.
-Cancellation or session replacement is not reported as a preparation failure.
-
-## 🚧 Limitations
-
-- Requires a compatible engine implementing the versioned prepared-compaction protocol. Installing this companion alone does not add provider support.
-- A changed branch, model, provider identity, tool set or preparation-affecting settings can invalidate prepared work.
-- Automatic application of a stale checkpoint cancels; it must not silently start a replacement inference request.
-- Background work may not be useful when a session changes quickly or the unprepared tail grows too large.
-
-## 🗂️ Package layout
-
-- `src/index.ts`: Pi source entrypoint.
-- `src/`: background controller, versioned engine protocol, settings and menu.
-- `test/`: independent deterministic tests with a fake engine.
-- `integration/`: relocated engine/companion integration regressions; see the integration runner.
-
-From a checkout, run `npm run check` and `npm test` for the standalone package.
-Run `npm run test:integration -- /path/to/pi-extensions` to test the pair against an explicit engine checkout.
-
-## 🔎 Keywords
-
-Pi, background compaction, asynchronous compaction, prepared checkpoints, safe boundaries.
-
-## 📄 License
-
-[MIT](LICENSE). Extracted from the MIT-licensed Pi extensions implementation; the original Narumi copyright notice is retained.
+[MIT](LICENSE). The original Narumi copyright notice is preserved.
