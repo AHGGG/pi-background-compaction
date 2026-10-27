@@ -299,7 +299,7 @@ test("reentrant notification invalidates the final boundary handoff", async () =
   await h.emit("session_shutdown");
 });
 
-test("preparation warning and lifecycle log show safe cause and elapsed time", async () => {
+test("one preparation warning shows safe cause and elapsed time", async () => {
   const h = fixture();
   const clock = vi.spyOn(performance, "now").mockReturnValue(1000);
   h.engine.capture = () => ({
@@ -318,6 +318,9 @@ test("preparation warning and lifecycle log show safe cause and elapsed time", a
     const log = h.notices.find((message) => message.includes("Async compaction failed"));
     assert.match(warning ?? "", /HTTP 429: rate limited \(elapsed: 2\.5s\)/);
     assert.match(log ?? "", /HTTP 429: rate limited \(elapsed: 2\.5s\)/);
+    assert.equal(warning, log, "the failure and pause belong to the same copyable warning");
+    assert.equal(h.notices.filter((message) => message.includes("Async compaction failed")).length, 1);
+    assert.match(warning ?? "", /diagnostics unavailable/i);
   } finally {
     clock.mockRestore();
     await h.emit("session_shutdown");
@@ -341,7 +344,7 @@ test("engine failure display is bounded and terminal safe", async () => {
   assert.ok(
     Array.from(warning).every((char) => {
       const code = char.codePointAt(0) ?? 0;
-      return code >= 32 && (code < 127 || code > 159) && code !== 0x202e;
+      return code === 10 || (code >= 32 && (code < 127 || code > 159) && code !== 0x202e);
     }),
   );
   assert.doesNotMatch(warning, /x{201}/);
@@ -412,8 +415,10 @@ test("live diagnostics update status, warn once, and retain the last failure aft
     finish({ usable: false, failure: "incomplete response" } as PreparedCheckpoint);
     await vi.advanceTimersByTimeAsync(0);
     assert.equal(vi.getTimerCount(), 0);
-    // Core owns the automatic report; the companion must not emit a second copy.
-    assert.equal(h.notices.filter((notice) => notice.includes("safe report")).length, 0);
+    const failures = h.notices.filter((notice) => notice.includes("Async compaction failed"));
+    assert.equal(failures.length, 1);
+    assert.match(failures[0], /Warm-ahead paused[\s\S]*safe report[\s\S]*attempt=2 body=eof/);
+    assert.equal(h.notices.filter((notice) => notice.includes("safe report")).length, 1);
     const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
     await command.handler("diagnostics", h.ctx);
     assert.match(h.notices.at(-1) ?? "", /attempt=1 body=eof\nattempt=2 body=eof/);
@@ -531,7 +536,7 @@ test("failure warning includes companion version and captured settings even with
   await drain();
   const warning = h.notices.find((notice) => notice.includes("Warm-ahead paused"));
   assert.match(warning ?? "", /companion=\d+\.\d+\.\d+ background=on threshold=70% autoApply=on lifecycleLogs=off/);
-  assert.equal(h.notices.filter((notice) => notice.includes("Async compaction failed")).length, 0);
+  assert.equal(h.notices.filter((notice) => notice.includes("Async compaction failed")).length, 1);
   await h.emit("session_shutdown");
 });
 
@@ -559,3 +564,101 @@ test("progress appears when an optional diagnostic getter becomes ready after st
     vi.useRealTimers();
   }
 });
+
+for (const mode of ["missing", "throwing", "delayed"] as const)
+  test(`combined failure handles ${mode} diagnostics without reproduction or raw errors`, async () => {
+    const h = fixture();
+    h.settings.logCompaction = false;
+    let final = false;
+    h.engine.capture = () => {
+      const preparation = {
+        requestTimeoutMs: 60_000,
+        isCurrent: () => true,
+        start: async (guard: { failureReportOwner?: "consumer" }) => {
+          assert.equal(guard.failureReportOwner, "consumer");
+          final = true;
+          return { usable: false, failure: "provider stream failed" } as PreparedCheckpoint;
+        },
+      };
+      if (mode !== "missing")
+        Object.defineProperty(preparation, "diagnostics", {
+          get: () => {
+            if (mode === "throwing") throw new Error("PRIVATE-DIAGNOSTIC-CREDENTIAL");
+            return () =>
+              final ? { status: "failed", report: "Compaction diagnostics schema=2\nbody=pipe-error" } : undefined;
+          },
+        });
+      return preparation;
+    };
+    await h.emit("session_start");
+    await h.turn();
+    await drain();
+    const failures = h.notices.filter((notice) => notice.includes("Async compaction failed"));
+    assert.equal(failures.length, 1);
+    assert.match(failures[0], /Warm-ahead paused/);
+    assert.match(failures[0], /companion=\d+\.\d+\.\d+/);
+    if (mode === "delayed") assert.match(failures[0], /Compaction diagnostics schema=2\nbody=pipe-error/);
+    else assert.match(failures[0], /diagnostics unavailable/i);
+    assert.doesNotMatch(h.notices.join("\n"), /PRIVATE-DIAGNOSTIC-CREDENTIAL/);
+    const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
+    await command.handler("resume", h.ctx);
+    await command.handler("diagnostics", h.ctx);
+    assert.match(h.notices.at(-1) ?? "", /Last failed preparation/);
+    if (mode === "delayed") assert.match(h.notices.at(-1) ?? "", /body=pipe-error/);
+    else assert.match(h.notices.at(-1) ?? "", /diagnostics unavailable/i);
+    await h.emit("session_shutdown");
+  });
+
+test("a failed final diagnostics read labels the retained snapshot instead of exposing the exception", async () => {
+  const h = fixture();
+  let finish!: (value: PreparedCheckpoint) => void;
+  let settled = false;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 60_000,
+    isCurrent: () => true,
+    diagnostics() {
+      if (settled) throw new Error("PRIVATE-FINAL-GETTER");
+      return { status: "stream", report: "safe earlier snapshot" };
+    },
+    start: () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  });
+  await h.emit("session_start");
+  await h.turn();
+  settled = true;
+  finish({ usable: false, failure: "stream failed" } as PreparedCheckpoint);
+  await drain();
+  const failures = h.notices.filter((notice) => notice.includes("Async compaction failed"));
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /Final diagnostic snapshot unavailable; last available diagnostics follow/);
+  assert.match(failures[0], /safe earlier snapshot/);
+  assert.doesNotMatch(failures[0], /PRIVATE-FINAL-GETTER/);
+  await h.emit("session_shutdown");
+});
+
+for (const logging of [true, false])
+  test(`an unusable result without a failure keeps the existing no-pause policy with logs=${logging}`, async () => {
+    const h = fixture();
+    h.settings.logCompaction = logging;
+    h.engine.capture = () => ({
+      requestTimeoutMs: 60_000,
+      isCurrent: () => true,
+      diagnostics: () => ({ status: "not usable", report: "safe unusable-result report" }),
+      start: async () => ({ usable: false }) as PreparedCheckpoint,
+    });
+    await h.emit("session_start");
+    await h.turn();
+    await drain();
+    assert.doesNotMatch(h.notices.join("\n"), /Warm-ahead paused/);
+    const failures = h.notices.filter((notice) => notice.includes("Async compaction failed"));
+    assert.equal(failures.length, logging ? 1 : 0);
+    if (logging) assert.match(failures[0], /safe unusable-result report/);
+    const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
+    await command.handler("resume", h.ctx);
+    assert.match(h.notices.at(-1) ?? "", /Warm-ahead is not paused/);
+    await command.handler("diagnostics", h.ctx);
+    assert.match(h.notices.at(-1) ?? "", /safe unusable-result report/);
+    await h.emit("session_shutdown");
+  });

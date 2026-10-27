@@ -45,11 +45,18 @@ export interface PreparationDiagnostics {
 }
 export interface CheckpointPreparation {
   readonly requestTimeoutMs: number;
-  /** Optional additive diagnostics support; the producer owns automatic failure-report emission. */
+  /** Optional additive diagnostics support; reporting stays producer-owned unless explicitly delegated. */
   diagnostics?(): PreparationDiagnostics;
   readonly reason?: string;
   isCurrent(): boolean;
-  start(guard: ApplicationGuard & { ownsStatus(): boolean; deadlineSignal?: AbortSignal }): Promise<PreparedCheckpoint>;
+  start(
+    guard: ApplicationGuard & {
+      ownsStatus(): boolean;
+      deadlineSignal?: AbortSignal;
+      /** Consumer will display the final preparation failure and diagnostics together. */
+      failureReportOwner?: "consumer";
+    },
+  ): Promise<PreparedCheckpoint>;
 }
 export type PreparedSourceResult =
   | { kind: "absent" }

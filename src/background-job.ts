@@ -21,6 +21,7 @@ export interface BackgroundJob {
   applicationFailure?: string;
   elapsedMs?: number;
   diagnostics?: PreparationDiagnostics;
+  diagnosticsUnavailable?: boolean;
   diagnosticContext: string;
   refreshDiagnostics(): PreparationDiagnostics | undefined;
 }
@@ -53,6 +54,7 @@ export function startBackgroundJob(
     refreshDiagnostics() {
       if (job.state === "Preparing") {
         const snapshot = readPreparationDiagnostics(preparation);
+        job.diagnosticsUnavailable = !snapshot;
         if (snapshot)
           job.diagnostics = { ...snapshot, report: `${job.diagnosticContext}\n${snapshot.report}`.slice(0, 16_384) };
       }
@@ -85,6 +87,7 @@ export function startBackgroundJob(
         deadlineSignal: deadline.signal,
         isCurrent: () => job.isCurrent(),
         ownsStatus: () => false,
+        failureReportOwner: "consumer",
       }),
       requestSignal,
     );

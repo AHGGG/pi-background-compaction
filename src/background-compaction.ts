@@ -95,19 +95,36 @@ export function createBackgroundCompactionExtension(
       owner.boundaryCheckpoint = undefined;
       ctx.ui.setStatus(STATUS_KEY, undefined);
     };
+    const preparationReport = (owner: Owner, job: BackgroundJob) => {
+      const available = job.diagnostics?.report;
+      const report = available
+        ? `${job.diagnosticsUnavailable ? "Final diagnostic snapshot unavailable; last available diagnostics follow.\n" : ""}${available}`
+        : `${job.diagnosticContext}\nDetailed diagnostics unavailable from the loaded compaction engine (unsupported or unreadable snapshot).`;
+      owner.lastFailureReport = report;
+      return report;
+    };
     const pause = (
       ctx: ExtensionContext,
       owner: Owner,
       reason: string,
       generation = owner.generation,
-      diagnosticContext?: string,
+      failedPreparation?: BackgroundJob,
     ) => {
       if (!owned(ctx, owner) || owner.generation !== generation || owner.pauseReason) return;
       reason = failureText(reason) || "compaction failed";
       owner.pauseReason = reason;
-      if (ctx.hasUI)
+      const recovery =
+        "Manual /compact and Pi automatic compaction remain available. Use /background-compaction resume to retry.";
+      if (failedPreparation) {
+        const report = preparationReport(owner, failedPreparation);
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `[background-compaction] Async compaction failed: ${reason}.\nWarm-ahead paused for this session. ${recovery}\n${report}`,
+            "warning",
+          );
+      } else if (ctx.hasUI)
         ctx.ui.notify(
-          `[background-compaction] Warm-ahead paused for this session. Reason: ${reason}.${diagnosticContext ? ` ${diagnosticContext}.` : ""} Manual /compact and Pi automatic compaction remain available. Use /background-compaction resume to retry.`,
+          `[background-compaction] Warm-ahead paused for this session. Reason: ${reason}. ${recovery}`,
           "warning",
         );
     };
@@ -266,7 +283,7 @@ export function createBackgroundCompactionExtension(
           }
         }
         if (automatic && job.applicationFailure && isCurrent() && !signal.aborted)
-          pause(ctx, owner, job.applicationFailure);
+          pause(ctx, owner, job.applicationFailure, owner.generation, job.state === "Failed" ? job : undefined);
         if (owner.job === job) owner.job = undefined;
         job.controller.abort();
         ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -565,10 +582,6 @@ export function createBackgroundCompactionExtension(
       void started.promise.then(
         () => {
           if (owner.job !== started || !owned(ctx, owner) || !started.isCurrent()) return;
-          if (started.state === "Failed" && started.diagnostics?.report)
-            owner.lastFailureReport = started.diagnostics.report;
-          if (started.applicationFailure)
-            pause(ctx, owner, preparationFailure(started), owner.generation, started.diagnosticContext);
           if (started.state === "Ready") {
             ctx.ui.setStatus(STATUS_KEY, undefined);
             if (ctx.hasUI)
@@ -582,17 +595,23 @@ export function createBackgroundCompactionExtension(
               );
           } else {
             ctx.ui.setStatus(STATUS_KEY, undefined);
-            log(
-              ctx,
-              `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.`,
-            );
+            if (started.applicationFailure) pause(ctx, owner, preparationFailure(started), owner.generation, started);
+            else
+              log(
+                ctx,
+                `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.\n${preparationReport(owner, started)}`,
+              );
           }
         },
         () => {
           if (owner.job === started && owned(ctx, owner) && started.isCurrent()) {
-            if (started.diagnostics?.report) owner.lastFailureReport = started.diagnostics.report;
             ctx.ui.setStatus(STATUS_KEY, undefined);
-            pause(ctx, owner, preparationFailure(started), owner.generation, started.diagnosticContext);
+            if (started.applicationFailure) pause(ctx, owner, preparationFailure(started), owner.generation, started);
+            else
+              log(
+                ctx,
+                `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.\n${preparationReport(owner, started)}`,
+              );
           }
         },
       );

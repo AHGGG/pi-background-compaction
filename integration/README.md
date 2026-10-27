@@ -12,6 +12,11 @@ The runner supplies test-only aliases to that checkout's engine and mock-Pi supp
 Production source never imports those aliases or another extension's private files.
 Set `REQUIRE_PREPARATION_DIAGNOSTICS=1` when checking a new diagnostics-capable engine;
 this makes absence of the optional capability fail instead of testing the older-engine path.
+Set `REQUIRE_CONSUMER_FAILURE_REPORTING=1` for the current reporting contract; it requires
+exactly one automatic full report, inside the companion's final failure warning. Older engines
+that provide diagnostics but ignore `failureReportOwner` may also print an earlier core report;
+the companion still includes the details so copying its failure is sufficient. Engines without
+diagnostics produce an explicit unavailable marker.
 
 These tests load the real core and background factories together through Pi's event bus.
 Providers and credentials are fixtures; no external model request is made. The native-runtime

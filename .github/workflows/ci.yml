@@ -43,7 +43,7 @@ jobs:
         with:
           repository: AHGGG/pi-extensions
           # Update this pin when adopting a new compatible engine version.
-          ref: 4ff480ecb21d145abfada8be0108903a035cfde2
+          ref: 25fc1414dcdf66f7c404e568df0848aac8c7f30a
           path: .integration-core
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -54,3 +54,4 @@ jobs:
       - run: npm run test:integration -- .integration-core
         env:
           REQUIRE_PREPARATION_DIAGNOSTICS: "1"
+          REQUIRE_CONSUMER_FAILURE_REPORTING: "1"

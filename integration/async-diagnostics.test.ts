@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { assistant, fixture } from "./async-compaction-fixture.js";
 
 async function ready(logCompaction = true) {
@@ -152,31 +152,65 @@ test("binding diagnostics remain silent without UI", async () => {
   assert.equal(h.notifications.length, previousCount);
 });
 
-for (const failure of ["transport", "auth"] as const)
+for (const failure of ["transport", "auth", "pipe-error", "timeout"] as const)
   test(`automatic ${failure} report is copyable without opening diagnostics or enabling lifecycle logs`, async () => {
-    const h = fixture({ logCompaction: false, maxRetries: 0 });
+    const h = fixture({ logCompaction: false, maxRetries: 0, requestTimeoutMs: 30_000 });
     await h.emit("session_start", {});
     const capable = typeof h.engine().capture(h.ctx)?.diagnostics === "function";
-    if (process.env.REQUIRE_PREPARATION_DIAGNOSTICS === "1")
+    if (process.env.REQUIRE_PREPARATION_DIAGNOSTICS === "1" || process.env.REQUIRE_CONSUMER_FAILURE_REPORTING === "1")
       assert.equal(capable, true, "this verification run requires the new engine diagnostics capability");
     if (failure === "transport") h.fail();
-    else
+    if (failure === "pipe-error")
+      h.setReply(
+        () =>
+          new Response(
+            new ReadableStream({
+              start(controller) {
+                queueMicrotask(() => controller.error(new Error("PRIVATE-PIPE-ERROR")));
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+      );
+    if (failure === "auth")
       h.ctx.modelRegistry.getApiKeyAndHeaders = async () => {
         throw new Error("PRIVATE-AUTH-ERROR");
       };
-    await h.start();
-    if (failure === "transport") await h.started;
-    h.release();
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (failure === "timeout") vi.useFakeTimers();
+    try {
+      await h.start();
+      if (failure !== "auth") await h.started;
+      if (failure === "timeout") await vi.advanceTimersByTimeAsync(30_000);
+      else {
+        h.release();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    } finally {
+      vi.useRealTimers();
+    }
     const initial = h.notifications.map(({ message }) => message);
+    const failures = initial.filter((message) => message.includes("Async compaction failed"));
+    assert.equal(failures.length, 1);
+    assert.match(failures[0], /Warm-ahead paused/);
     assert.equal(initial.filter((message) => message.includes("Warm-ahead paused")).length, 1);
-    assert.doesNotMatch(initial.join("\n"), /PRIVATE-AUTH-ERROR|fixture-key|snapshot user|example\.test/);
+    assert.doesNotMatch(
+      initial.join("\n"),
+      /PRIVATE-AUTH-ERROR|PRIVATE-PIPE-ERROR|fixture-key|snapshot user|example\.test/,
+    );
     if (capable) {
       const reports = initial.filter((message) => message.includes("Compaction diagnostics"));
-      assert.equal(reports.length, 1, "exactly one full report is emitted automatically by the engine");
-      assert.match(reports[0], /utc=/);
-      assert.match(reports[0], /timeoutMs=/);
-      assert.match(reports[0], /termination=/);
+      if (process.env.REQUIRE_CONSUMER_FAILURE_REPORTING === "1")
+        assert.equal(reports.length, 1, "the capable pair emits one combined full report");
+      else
+        assert.ok(
+          reports.length === 1 || reports.length === 2,
+          "older diagnostics engines may retain their separate core report",
+        );
+      assert.match(failures[0], /Compaction diagnostics[\s\S]*utc=/);
+      assert.match(failures[0], /timeoutMs=/);
+      assert.match(failures[0], /termination=/);
+      if (failure === "pipe-error") assert.match(failures[0], /body=pipe-error/);
+      if (failure === "timeout") assert.match(failures[0], /abort\(d\/c\/p\)=1\/0\//);
       await h.commands.get("background-compaction")?.handler("resume", h.ctx);
       await h.commands.get("background-compaction")?.handler("diagnostics", h.ctx);
       const retained = h.notifications.at(-1)?.message ?? "";
@@ -186,6 +220,27 @@ for (const failure of ["transport", "auth"] as const)
       assert.doesNotMatch(retained, /PRIVATE-AUTH-ERROR|fixture-key|snapshot user|example\.test/);
     } else {
       assert.equal(initial.filter((message) => message.includes("Compaction diagnostics")).length, 0);
+      assert.match(failures[0], /diagnostics unavailable/i);
     }
+    h.release();
     await h.emit("session_shutdown", {});
   });
+
+test("manual compaction waiting on a failed preparation keeps one complete background warning", async () => {
+  const h = fixture({ logCompaction: false, maxRetries: 0 });
+  await h.emit("session_start", {});
+  h.fail();
+  await h.start();
+  await h.started;
+  const pending = h.compact("manual");
+  h.release();
+  await pending;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const failures = h.notifications.filter(({ message }) => message.includes("Async compaction failed"));
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].message, /Warm-ahead paused/);
+  const capable = typeof h.engine().capture(h.ctx)?.diagnostics === "function";
+  assert.match(failures[0].message, capable ? /Compaction diagnostics/ : /diagnostics unavailable/i);
+  assert.doesNotMatch(failures[0].message, /fixture-key|snapshot user|example\.test/);
+  await h.emit("session_shutdown", {});
+});
