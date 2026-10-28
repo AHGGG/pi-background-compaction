@@ -46,7 +46,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: AHGGG/pi-extensions
-          ref: 25fc1414dcdf66f7c404e568df0848aac8c7f30a
+          ref: b8da70a5b6ff687907489fc148088192124093d6
           path: .integration-core
           persist-credentials: false
 
@@ -55,6 +55,7 @@ jobs:
         env:
           REQUIRE_PREPARATION_DIAGNOSTICS: "1"
           REQUIRE_CONSUMER_FAILURE_REPORTING: "1"
+          REQUIRE_TEXT_SUMMARY: "1"
 
       - name: Inspect the npm package
         run: npm pack --dry-run

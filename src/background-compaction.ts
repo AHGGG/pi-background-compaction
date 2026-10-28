@@ -576,9 +576,9 @@ export function createBackgroundCompactionExtension(
       if (!preparation) return;
       const started = startBackgroundJob(preparation, ctx, runtime, owner.controller.signal, () => owned(ctx, owner));
       owner.job = started;
-      ctx.ui.setStatus(STATUS_KEY, "Preparing checkpoint…");
+      ctx.ui.setStatus(STATUS_KEY, "Preparing compaction…");
       if (ctx.hasUI && supportsPreparationDiagnostics(preparation)) watchPreparation(ctx, owner, started);
-      log(ctx, "Async compaction triggered: preparing a checkpoint in the background.");
+      log(ctx, "Async compaction triggered: preparing a compaction result in the background.");
       void started.promise.then(
         () => {
           if (owner.job !== started || !owned(ctx, owner) || !started.isCurrent()) return;
@@ -588,8 +588,8 @@ export function createBackgroundCompactionExtension(
               ctx.ui.notify(
                 `[background-compaction] ${
                   runtime.get().settings.asyncAutoApply
-                    ? "Async compaction ready: the prepared checkpoint will apply after the current model/tool batch, or at the next idle input boundary."
-                    : "Async compaction ready: run /compact to apply the prepared checkpoint. History is unchanged until compaction."
+                    ? "Async compaction ready: the prepared compaction will apply after the current model/tool batch, or at the next idle input boundary."
+                    : "Async compaction ready: run /compact to apply the prepared compaction. History is unchanged until compaction."
                 }`,
                 "info",
               );

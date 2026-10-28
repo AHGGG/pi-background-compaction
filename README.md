@@ -1,6 +1,6 @@
 # pi-background-compaction
 
-Reduce compaction pauses and keep your coding tasks moving by preparing checkpoints in the background. When compaction is needed, Pi can reuse a prepared checkpoint instead of starting from scratch.
+Reduce compaction pauses and keep your coding tasks moving by preparing compaction results in the background. When compaction is needed, Pi can reuse a prepared result instead of starting from scratch.
 
 English | [简体中文](README.zh-CN.md)
 
@@ -36,6 +36,19 @@ There are two ways to use a prepared checkpoint:
 
 A **Ready** checkpoint has been prepared, not yet written into the session. Changes to the session, model, provider, tools, or relevant settings can make it unusable. The engine checks it before applying it.
 
+## Choose the output format
+
+The companion schedules work; the engine chooses what to prepare. With a current `pi-codex-compact`, open `/codex-compact` → **Settings** and choose **Text summary** or **Provider checkpoint** as the compaction mode:
+
+- **Text summary:** send a normal model request to summarize the captured history. Scratchpad guidance is included. The main agent can keep working while the summary is prepared.
+- **Provider checkpoint (default):** ask the provider for an encrypted/opaque checkpoint.
+
+Keep **Apply when ready** on in `/background-compaction` to apply either result automatically at the next safe boundary. Preparation does not replace the current history; application replaces the summarized prefix, keeps a safe recent raw tail, and preserves newer messages and tool results. A changed branch or incompatible settings can invalidate a result, but ordinary appended messages are allowed.
+
+Keep the core engine enabled when changing formats. Existing encrypted history still needs its compatible provider for replay before it can become a text summary. Text summary mode uses the engine's supported Responses providers; it does not add support for every provider API.
+
+Applying either format changes the conversation prefix and can reduce cache reuse on the next request. A prepared summary is not a promise of a cache hit or lower cost. No new companion setting or second background scheduler is needed.
+
 ## How it works
 
 With the default settings:
@@ -43,11 +56,11 @@ With the default settings:
 ```mermaid
 flowchart TD
     A[Pi works on your task] --> B[Turn completes with context usage at 70% or more]
-    B --> C[Prepare a checkpoint in the background]
+    B --> C[Prepare a text summary or provider checkpoint]
     C -.-> D[Pi can keep working]
-    C --> E[Checkpoint ready]
+    C --> E[Compaction result ready]
     E --> F[Validate at a safe boundary]
-    F --> G[Apply checkpoint and continue]
+    F --> G[Apply result, keep newer messages, and continue]
 ```
 
 A safe boundary is after the current model/tool batch or at the next idle input boundary, not in the middle of an active request. If actual compaction starts before preparation finishes, it waits for compatible background work. If that work fails or cannot be used, the engine runs compaction in the foreground.

@@ -60,7 +60,7 @@ export function createBackgroundCompactionMenu(
     `Background preparation: ${state.settings.asyncEnabled ? `On · ${state.settings.asyncThresholdPercent}%` : "Off"}`,
     `Apply when ready: ${state.settings.asyncAutoApply ? "On" : "Off"}`,
     `Lifecycle logs: ${state.settings.logCompaction ? "On" : "Off"}`,
-    `Prepared checkpoint: ${options.backgroundStatus?.() ?? "none"}`,
+    `Prepared compaction: ${options.backgroundStatus?.() ?? "none"}`,
     ...(options.preparationStatus?.() ? [`Preparation: ${safeText(options.preparationStatus() ?? "")}`] : []),
     ...(options.warmPauseReason?.() ? [`Paused: ${safeText(options.warmPauseReason() ?? "")}`] : []),
     `Settings: ${safeText(state.path)}`,
@@ -100,7 +100,7 @@ export function createBackgroundCompactionMenu(
           {
             id: "asyncEnabled",
             label: "Background preparation (experimental)",
-            description: "Prepare a checkpoint after a completed turn. May consume quota even if unused.",
+            description: "Prepare a compaction result after a completed turn. May consume quota even if unused.",
             currentValue: state.settings.asyncEnabled ? "On" : "Off",
             values: ["On", "Off"],
             action: "set-enabled",
@@ -151,8 +151,8 @@ export function createBackgroundCompactionMenu(
         title: "Background Compaction Help",
         lines: [
           "Requires a compatible prepared-compaction engine extension; it does not perform provider requests by itself.",
-          "Enable background preparation in Settings. Automatic application is a separate opt-in.",
-          "A prepared checkpoint applies only at a safe Pi boundary. Manual /compact remains available.",
+          "Background preparation and Apply when ready are on by default. Choose the output format in the engine settings.",
+          "A prepared compaction result applies only at a safe Pi boundary. Manual /compact remains available.",
           "Use /background-compaction resume to clear a session-only failure pause.",
           "Failures print a complete report when the engine supports diagnostics; /background-compaction diagnostics shows retained reports.",
           "Preparation progress and inactivity advisories do not change the request deadline.",

@@ -17,6 +17,10 @@ exactly one automatic full report, inside the companion's final failure warning.
 that provide diagnostics but ignore `failureReportOwner` may also print an earlier core report;
 the companion still includes the details so copying its failure is sufficient. Engines without
 diagnostics produce an explicit unavailable marker.
+Set `REQUIRE_TEXT_SUMMARY=1` when checking a Text summary-capable engine; this requires
+the new mode and exercises plaintext preparation, automatic application, retained tool pairs,
+manual waiting, cancellation, invalidation, and incomplete-output rejection. Older engines
+without the mode skip only this suite.
 
 These tests load the real core and background factories together through Pi's event bus.
 Providers and credentials are fixtures; no external model request is made. The native-runtime
@@ -33,6 +37,7 @@ suite uses Pi's real session runner with a local mocked provider transport.
 | `midrun-auto-apply` | Serialized tool-batch drafts, exact ancestry, retained ready work, commit confirmation |
 | `ready-after-retry` | Model-error deferral, successful retry, manual reuse, abort and one-attempt guards |
 | `async-auto-apply-native` | Actual Pi session input, settlement and successful model-retry application without aborting active work |
+| `text-summary` | Text summary preparation and automatic application without extra inference; preserved tails and failure safety |
 | `engine-contract` | Both installation orders and core-alone foreground behavior |
 
 The first eight suites were extracted from `pi-codex-compact` at commit

@@ -553,7 +553,7 @@ test("progress appears when an optional diagnostic getter becomes ready after st
     });
     await h.emit("session_start");
     await h.turn();
-    assert.equal(h.statuses.at(-1), "Preparing checkpoint…");
+    assert.equal(h.statuses.at(-1), "Preparing compaction…");
     ready = true;
     await vi.advanceTimersByTimeAsync(5_000);
     assert.equal(h.statuses.at(-1), "stream elapsed=5s");

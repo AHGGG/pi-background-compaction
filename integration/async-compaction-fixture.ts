@@ -116,6 +116,8 @@ export function fixture(overrides = {}, order: "core-first" | "background-first"
   let fetchOverride: (() => Promise<Response>) | undefined;
   const requestSignals: AbortSignal[] = [];
   const captured: unknown[] = [];
+  const payloads: unknown[] = [];
+  const outputBudgets: (number | undefined)[] = [];
   const provider: Provider = {
     id: model.provider,
     name: "Fixture",
@@ -126,7 +128,8 @@ export function fixture(overrides = {}, order: "core-first" | "background-first"
       void (async () => {
         try {
           captured.push(structuredClone(context.messages));
-          await options?.onPayload?.(
+          outputBudgets.push(options?.maxTokens);
+          const payload = await options?.onPayload?.(
             {
               model: active.id,
               input: context.messages.map((message) => ({
@@ -147,13 +150,30 @@ export function fixture(overrides = {}, order: "core-first" | "background-first"
             },
             active,
           );
+          payloads.push(structuredClone(payload));
           const result = await options?.fetch?.("https://example.test/responses", {
             method: "POST",
             signal: options.signal,
           });
-          for (const line of ((await result?.text()) ?? "").split("\n"))
-            if (line.startsWith("data: ")) await options?.onProviderStreamEvent?.(JSON.parse(line.slice(6)), active);
-          const message = assistant("done") as Extract<AgentMessage, { role: "assistant" }>;
+          let completion = "done";
+          for (const line of ((await result?.text()) ?? "").split("\n")) {
+            if (!line.startsWith("data: ")) continue;
+            const event = JSON.parse(line.slice(6));
+            await options?.onProviderStreamEvent?.(event, active);
+            if (event.type === "response.completed" && Array.isArray(event.response?.output)) {
+              const messages = event.response.output.filter((item: { type?: string }) => item.type === "message");
+              if (messages.length)
+                completion = messages
+                  .map((item: { content: { type?: string; text?: string }[] }) =>
+                    item.content
+                      .filter((part) => part.type === "output_text")
+                      .map((part) => part.text ?? "")
+                      .join(""),
+                  )
+                  .join("\n");
+            }
+          }
+          const message = assistant(completion) as Extract<AgentMessage, { role: "assistant" }>;
           stream.push({ type: "done", reason: "stop", message });
           stream.end(message);
         } catch (error) {
@@ -235,6 +255,8 @@ export function fixture(overrides = {}, order: "core-first" | "background-first"
     runtime,
     provider,
     captured,
+    payloads,
+    outputBudgets,
     requestSignals,
     started: started.promise,
     emit,

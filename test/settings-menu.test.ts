@@ -218,7 +218,7 @@ test("TUI framing remains bounded and focused settings survive resize", async ()
     },
   });
   assert.equal(screens, 4);
-  assert.match(main.join("\n"), /Prepared checkpoint: Ready/);
+  assert.match(main.join("\n"), /Prepared compaction: Ready/);
   assert.match(normal[0], /^─+$/);
   assert.match(normal.at(-1) ?? "", /^─+$/);
   assert.match(normal.join("\n"), /Background preparation/);
