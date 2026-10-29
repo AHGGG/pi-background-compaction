@@ -854,3 +854,152 @@ test("idle input validates an eligible ready snapshot once and skips validation 
   assert.equal(validations, 0);
   await h.emit("session_shutdown");
 });
+
+async function pendingPreparation() {
+  const h = fixture();
+  let finish!: (value: PreparedCheckpoint) => void;
+  let signal!: AbortSignal;
+  let valid = true;
+  let starts = 0;
+  let validations = 0;
+  let drafts = 0;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 60_000,
+    isCurrent: () => {
+      validations += 1;
+      return valid;
+    },
+    reason: "captured prefix changed",
+    start: (guard) => {
+      starts += 1;
+      signal = guard.signal;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    },
+  });
+  await h.emit("session_start");
+  await h.turn();
+  h.ctx.getContextUsage = () => ({ tokens: 10, contextWindow: 100, percent: 10 });
+  h.ctx.isIdle = () => true;
+  let compacts = 0;
+  h.ctx.compact = (options) => {
+    compacts += 1;
+    options?.onComplete?.();
+  };
+  return {
+    ...h,
+    signal,
+    fail: () => h.emit("turn_end", { outcome: "error", entries: [] }),
+    invalidate: () => {
+      valid = false;
+    },
+    async release() {
+      finish({
+        usable: true,
+        checkpointId: "checkpoint",
+        adopt: async () => ({ kind: "cancel" }),
+        draft: async () => {
+          drafts += 1;
+          return {
+            checkpointId: "checkpoint",
+            draft: { type: "compaction", summary: "summary", firstKeptEntryId: "entry", details: {} },
+          };
+        },
+      });
+      await drain();
+    },
+    counts: () => ({ starts, validations, drafts, compacts }),
+  };
+}
+
+for (const initiallyReady of [false, true])
+  test(`model errors preserve one valid preparation until successful retry (ready=${initiallyReady})`, async () => {
+    const h = await pendingPreparation();
+    if (initiallyReady) await h.release();
+    const before = h.counts().validations;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await h.fail();
+      await h.emit("context");
+      await h.emit("agent_settled", { aborted: false });
+      await h.emit("input");
+      assert.equal(h.signal.aborted, false);
+      assert.equal(h.counts().starts, 1);
+      assert.equal(h.counts().drafts, 0);
+      assert.equal(h.counts().compacts, 0);
+    }
+    assert.ok(h.counts().validations > before, "error turns must validate the captured snapshot");
+    if (!initiallyReady) {
+      await h.release();
+      assert.match(h.notices.at(-1) ?? "", /waiting for a successful completed turn/);
+    }
+    await h.emit("agent_settled", { aborted: false });
+    await h.emit("input");
+    assert.equal(h.counts().compacts, 0, "becoming Ready must not clear the failed-turn gate");
+    await h.fail();
+    const result = (await h.turn()) as { entries: unknown[] };
+    assert.equal(result.entries.length, 1);
+    h.commit();
+    await h.emit("turn_start");
+    await h.turn();
+    await h.emit("agent_settled", { aborted: false });
+    await h.emit("input");
+    assert.deepEqual(h.counts(), { ...h.counts(), starts: 1, drafts: 1, compacts: 0 });
+    assert.equal(h.notices.filter((notice) => notice.includes("committed at")).length, 1);
+    assert.doesNotMatch(h.notices.join("\n"), /cancelled|discarded|Warm-ahead paused/);
+    await h.emit("session_shutdown");
+  });
+
+test("a successful retry while preparation is pending permits exactly one later idle application", async () => {
+  const h = await pendingPreparation();
+  await h.fail();
+  assert.equal(await h.turn(), undefined);
+  assert.equal(h.counts().starts, 1, "a successful retry must not duplicate pending preparation");
+  assert.equal(h.signal.aborted, false);
+  await h.release();
+  await h.emit("agent_settled", { aborted: false });
+  await h.emit("input");
+  assert.equal(h.counts().compacts, 1);
+  assert.equal(h.counts().drafts, 0);
+  assert.equal(h.counts().starts, 1);
+  await h.emit("session_shutdown");
+});
+
+for (const cancellation of [
+  "run-abort",
+  "aborted-turn",
+  "aborted-settlement",
+  "session_before_switch",
+  "session_before_fork",
+  "session_before_tree",
+  "model_select",
+  "settings",
+  "stale-error",
+] as const)
+  test(`failed-turn preservation still cancels pending work on ${cancellation}`, async () => {
+    const h = await pendingPreparation();
+    await h.fail();
+    if (cancellation === "run-abort") h.run.abort();
+    else if (cancellation === "aborted-turn") await h.emit("turn_end", { outcome: "aborted", entries: [] });
+    else if (cancellation === "aborted-settlement") await h.emit("agent_settled", { aborted: true });
+    else if (cancellation === "settings") {
+      h.settings.asyncEnabled = false;
+      await h.emit("context");
+    } else if (cancellation === "stale-error") {
+      h.invalidate();
+      await h.fail();
+    } else await h.emit(cancellation);
+    assert.equal(h.signal.aborted, true);
+    await h.release();
+    await h.turn();
+    await h.emit("agent_settled", { aborted: false });
+    await h.emit("input");
+    assert.equal(h.counts().starts, 1);
+    assert.equal(h.counts().drafts, 0);
+    assert.equal(h.counts().compacts, 0);
+    assert.doesNotMatch(h.notices.join("\n"), /checkpoint is no longer current|Warm-ahead paused/);
+    if (cancellation === "stale-error") assert.match(h.notices.join("\n"), /captured prefix changed/);
+    if (cancellation === "aborted-turn" || cancellation === "aborted-settlement")
+      assert.match(h.notices.join("\n"), /main run was cancelled/);
+    await h.emit("session_shutdown");
+  });

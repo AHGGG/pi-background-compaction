@@ -221,7 +221,7 @@ export function createBackgroundCompactionExtension(
       confirmBoundary(ctx);
       const job = owners.get(ctx.sessionManager)?.job;
       if (job?.state === "Ready" && job.isCurrent()) attempted.add(job);
-      else if (job) cancelJob(ctx);
+      else if (job) cancelJob(ctx, job.validationFailure ?? "main run was cancelled");
     };
     const beforeCompact: PreparedCompactionSource["beforeCompact"] = async (event, ctx, guard) => {
       const owner = ownerFor(ctx);
@@ -513,7 +513,12 @@ export function createBackgroundCompactionExtension(
       const owner = ownerFor(ctx);
       if (event.outcome !== "completed" || ctx.signal?.aborted) {
         const job = owner.job;
-        if (event.outcome === "error" && !ctx.signal?.aborted && job?.state === "Ready" && job.isCurrent())
+        if (
+          event.outcome === "error" &&
+          !ctx.signal?.aborted &&
+          (job?.state === "Preparing" || job?.state === "Ready") &&
+          job.isCurrent()
+        )
           awaitingCompletedTurn.add(job);
         else stopPreparation(ctx);
         return;
@@ -627,7 +632,9 @@ export function createBackgroundCompactionExtension(
             ctx.ui.notify(
               `[background-compaction] ${
                 runtime.get().settings.asyncAutoApply
-                  ? "Async compaction ready: the prepared compaction will apply after the current model/tool batch, or at the next idle input boundary."
+                  ? awaitingCompletedTurn.has(started)
+                    ? "Async compaction ready: waiting for a successful completed turn before automatic application."
+                    : "Async compaction ready: the prepared compaction will apply after the current model/tool batch, or at the next idle input boundary."
                   : "Async compaction ready: run /compact to apply the prepared compaction. History is unchanged until compaction."
               }`,
               "info",

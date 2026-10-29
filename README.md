@@ -73,7 +73,7 @@ If a compatible checkpoint is still being prepared, plain `/compact` waits for i
 - Custom instructions passed to `/compact` replace the pending background work so the new instructions are respected.
 - If the Pi host cancels an active run before dispatching `/compact`, work already cancelled by that action cannot be reused.
 
-With **Apply when ready** enabled, a ready checkpoint is not applied during a failed model request or its retry. After a successful completed turn, it can be applied if it is still valid. Explicit cancellation prevents automatic application of that checkpoint; manual `/compact` remains available.
+A failed model request does not cancel still-valid background preparation or start a duplicate request during retries. With **Apply when ready** enabled, a result that becomes ready during a failed request or its retry waits without changing history. After a successful completed turn, it can be applied if it is still valid. Explicit cancellation prevents automatic application of that checkpoint; manual `/compact` remains available.
 
 ## Commands
 
