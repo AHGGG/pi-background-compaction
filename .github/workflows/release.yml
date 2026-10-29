@@ -46,7 +46,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: AHGGG/pi-extensions
-          ref: b8da70a5b6ff687907489fc148088192124093d6
+          ref: a88fa05e6cda75fc30ab2d5647bf62539727cd70
           path: .integration-core
           persist-credentials: false
 

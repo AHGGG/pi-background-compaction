@@ -34,7 +34,7 @@ There are two ways to use a prepared checkpoint:
 - **Turn Apply when ready off:** the checkpoint waits for manual `/compact` or Pi's automatic compaction.
 - **Leave Apply when ready on (default):** the extension can apply it after the current model/tool batch or at the next idle input boundary, once validation succeeds.
 
-A **Ready** checkpoint has been prepared, not yet written into the session. Changes to the session, model, provider, tools, or relevant settings can make it unusable. The engine checks it before applying it.
+A **Ready** checkpoint has been prepared, not yet written into the session. Changes to the session, model, provider, or relevant settings can make it unusable. The engine checks it before applying it. With a current engine, Text summaries survive system-prompt, active-tool, and thinking-level changes; provider checkpoints keep their stricter checks.
 
 ## Choose the output format
 
@@ -80,7 +80,7 @@ With **Apply when ready** enabled, a ready checkpoint is not applied during a fa
 | Command | Action |
 | --- | --- |
 | `/background-compaction` | Open Settings, Status, and Help in the terminal UI. |
-| `/background-compaction diagnostics` | Show the current and last failed preparation reports retained in this session. |
+| `/background-compaction diagnostics` | Show current preparation, the last stopped outcome, and the last failed report retained in this session. |
 | `/background-compaction resume` | Clear a failure pause for this session. Preparation can start after the next completed turn. |
 | `/compact` | Run Pi's compaction, reusing compatible background work when available. |
 
@@ -117,7 +117,7 @@ With a diagnostics-capable engine, the status line shows elapsed time and recent
 
 Use `/background-compaction resume` when you want to try background preparation again. This clears the pause; it does not immediately send a provider request.
 
-A checkpoint can also be discarded because the session changed or it no longer fits. Discarding an outdated checkpoint is not the same as a provider failure. Automatic application will not silently send a new provider request to replace an invalid checkpoint.
+A checkpoint can also be discarded because the session changed or it no longer fits. Status retains the last preparation outcome and its safe reason separately from current work. Diagnostics label current and retained reports, and use the producer's final snapshot when it becomes available. Expected session/ownership invalidation and explicit cancellation are not provider failures and do not create a failure pause. Genuine preparation or application failures, including a result that exceeds the available budget, retain the existing failure-pause behavior. Automatic application will not silently send a new provider request to replace an invalid checkpoint.
 
 This extension does not add provider support or credentials. Requests use the compatible engine's existing provider route and authentication. Install only extensions and engines you trust. Check the engine's documentation for its data handling, supported providers, and recovery behavior.
 

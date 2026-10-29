@@ -79,7 +79,7 @@ for (const action of ["run", "owner", "controller"] as const)
     if (action === "controller") job.controller.abort();
     else h[action].abort();
     await result;
-    assert.equal(job.state, "Failed");
+    assert.equal(job.state, "Cancelled");
     assert.equal(job.isCurrent(), false);
   });
 
@@ -219,4 +219,63 @@ test("progress checks never revalidate the potentially large engine snapshot", a
   assert.equal(validations, 0);
   h.resolve(h.handle);
   await job.promise;
+});
+
+for (const outcome of ["discarded", "cancelled"] as const)
+  test(`terminal ${outcome} is not a provider failure`, async () => {
+    const h = fixture();
+    h.preparation.diagnostics = () => ({ status: outcome, report: "final report", outcome, reason: "session changed" });
+    const job = h.start();
+    h.resolve({ usable: false, failure: "legacy generic failure" } as PreparedCheckpoint);
+    await job.promise;
+    assert.equal(job.state, outcome === "discarded" ? "Discarded" : "Cancelled");
+    assert.equal(job.validationFailure, "session changed");
+    assert.equal(job.applicationFailure, undefined);
+    assert.equal(job.diagnosticsUnavailable, false);
+  });
+
+test("cancellation retains earlier diagnostics as non-final until the producer actually settles", async () => {
+  const h = fixture();
+  let report = "earlier progress";
+  h.preparation.diagnostics = () => ({ status: "status", report });
+  const job = h.start();
+  job.refreshDiagnostics();
+  job.validationFailure = "settings changed";
+  job.controller.abort();
+  await assert.rejects(job.promise);
+  assert.equal(job.state, "Cancelled");
+  assert.equal(job.diagnosticsUnavailable, true);
+  assert.ok(job.diagnostics?.report.endsWith("earlier progress"));
+  assert.equal(job.isCurrent(), false);
+  assert.equal(job.validationFailure, "settings changed");
+  report = "actual final cancellation";
+  h.resolve({ usable: false } as PreparedCheckpoint);
+  await Promise.resolve();
+  assert.equal(job.diagnosticsUnavailable, false);
+  assert.ok(job.diagnostics?.report.endsWith("actual final cancellation"));
+  report = "changed after final";
+  assert.ok(job.refreshDiagnostics()?.report.endsWith("actual final cancellation"));
+});
+
+test("retained records contain metadata only and receive the producer's later final diagnostics", async () => {
+  const h = fixture();
+  let report = "progress";
+  h.preparation.diagnostics = () => ({ status: "status", report });
+  const job = h.start();
+  job.refreshDiagnostics();
+  job.controller.abort();
+  await assert.rejects(job.promise);
+  const record = job.retain();
+  assert.equal(record.state, "Cancelled");
+  assert.equal("promise" in record, false);
+  assert.equal("controller" in record, false);
+  assert.equal(
+    Object.values(record).some((value) => typeof value === "function"),
+    false,
+  );
+  report = "terminal report";
+  h.resolve({ usable: false } as PreparedCheckpoint);
+  await Promise.resolve();
+  assert.equal(record.diagnosticsUnavailable, false);
+  assert.ok(record.diagnostics?.report.endsWith("terminal report"));
 });

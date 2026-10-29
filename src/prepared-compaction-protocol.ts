@@ -42,6 +42,9 @@ export interface PreparationDiagnostics {
   status: string;
   report: string;
   warning?: string;
+  /** Optional producer-owned terminal result and safe reason; never infer these from report text. */
+  outcome?: "failed" | "prepared" | "ready" | "recovered" | "discarded" | "cancelled";
+  reason?: string;
 }
 export interface CheckpointPreparation {
   readonly requestTimeoutMs: number;

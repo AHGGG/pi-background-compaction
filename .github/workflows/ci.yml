@@ -43,7 +43,7 @@ jobs:
         with:
           repository: AHGGG/pi-extensions
           # Update this pin when adopting a new compatible engine version.
-          ref: b8da70a5b6ff687907489fc148088192124093d6
+          ref: a88fa05e6cda75fc30ab2d5647bf62539727cd70
           path: .integration-core
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

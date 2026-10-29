@@ -286,3 +286,15 @@ test("status retains readable multiline diagnostics without expanding the main m
   assert.doesNotMatch(main.lines?.join("\n") ?? "", /attempt=1/);
   assert.match(status.lines?.join("\n") ?? "", /attempt=1 body=eof\nattempt=2 body=eof/);
 });
+
+test("status distinguishes an empty current slot from the retained cancellation reason", () => {
+  const { runtime } = memoryRuntime();
+  const menu = createBackgroundCompactionMenu(runtime, {
+    lastPreparationStatus: () => "Discarded — captured prefix changed",
+  });
+  const status = resolveMenuScreen(menu, "status", runtime.get());
+  assert.match(
+    status.lines?.join("\n") ?? "",
+    /Prepared compaction: none\nLast preparation: Discarded — captured prefix changed/,
+  );
+});

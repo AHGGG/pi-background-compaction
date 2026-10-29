@@ -15,6 +15,7 @@ export interface SettingsMenuOwner {
   isCurrent(): boolean;
   backgroundStatus?(): "Preparing" | "Ready" | undefined;
   warmPauseReason?(): string | undefined;
+  lastPreparationStatus?(): string | undefined;
   preparationStatus?(): string | undefined;
   diagnosticReport?(): string | undefined;
   onResumeWarm?(): void;
@@ -25,6 +26,7 @@ type MenuOptions = Pick<
   SettingsMenuOwner,
   | "backgroundStatus"
   | "warmPauseReason"
+  | "lastPreparationStatus"
   | "preparationStatus"
   | "diagnosticReport"
   | "onResumeWarm"
@@ -61,6 +63,9 @@ export function createBackgroundCompactionMenu(
     `Apply when ready: ${state.settings.asyncAutoApply ? "On" : "Off"}`,
     `Lifecycle logs: ${state.settings.logCompaction ? "On" : "Off"}`,
     `Prepared compaction: ${options.backgroundStatus?.() ?? "none"}`,
+    ...(options.lastPreparationStatus?.()
+      ? [`Last preparation: ${safeText(options.lastPreparationStatus() ?? "")}`]
+      : []),
     ...(options.preparationStatus?.() ? [`Preparation: ${safeText(options.preparationStatus() ?? "")}`] : []),
     ...(options.warmPauseReason?.() ? [`Paused: ${safeText(options.warmPauseReason() ?? "")}`] : []),
     `Settings: ${safeText(state.path)}`,
@@ -137,11 +142,7 @@ export function createBackgroundCompactionMenu(
         lines: [
           ...status(state),
           ...(options.diagnosticReport?.()
-            ? [
-                "",
-                "Latest retained diagnostic report:",
-                ...(options.diagnosticReport() ?? "").split("\n").map(safeText),
-              ]
+            ? ["", "Preparation diagnostics:", ...(options.diagnosticReport() ?? "").split("\n").map(safeText)]
             : []),
         ],
         hint: "back",
@@ -201,6 +202,7 @@ export async function showBackgroundCompactionMenu(
     createBackgroundCompactionMenu(runtime, {
       backgroundStatus: owner.backgroundStatus,
       warmPauseReason: owner.warmPauseReason,
+      lastPreparationStatus: owner.lastPreparationStatus,
       preparationStatus: owner.preparationStatus,
       diagnosticReport: owner.diagnosticReport,
       onResumeWarm: () => {

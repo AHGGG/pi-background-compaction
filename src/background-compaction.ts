@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { abortable } from "./abortable.js";
-import { type BackgroundJob, startBackgroundJob } from "./background-job.js";
+import { type BackgroundJob, type PreparationRecord, startBackgroundJob } from "./background-job.js";
 import { CompactionTimings } from "./compaction-timing.js";
 import { supportsPreparationDiagnostics } from "./preparation-diagnostics.js";
 import {
@@ -34,7 +34,8 @@ type Owner = {
   sessionId: string;
   job?: BackgroundJob;
   pauseReason?: string;
-  lastFailureReport?: string;
+  lastPreparation?: PreparationRecord;
+  lastFailedPreparation?: PreparationRecord;
   generation: number;
   operation?: AbortController;
   compactionPending?: boolean;
@@ -84,24 +85,50 @@ export function createBackgroundCompactionExtension(
       const owner = owners.get(ctx.sessionManager);
       const job = owner?.job;
       if (!owner || !job) return;
-      if (job.state !== "Failed")
-        log(
-          ctx,
-          `${job.state === "Ready" ? "Async compaction checkpoint discarded." : "Async compaction cancelled."} Reason: ${reason ?? job.validationFailure ?? "checkpoint is no longer current"}.`,
-        );
+      let notice: string | undefined;
+      if (job.state !== "Failed") {
+        job.validationFailure = reason ?? job.validationFailure ?? "checkpoint is no longer current";
+        notice = `${job.state === "Ready" || job.state === "Discarded" ? "Async compaction checkpoint discarded." : "Async compaction cancelled."} Reason: ${job.validationFailure}.`;
+        if (job.state !== "Discarded" && job.state !== "Cancelled")
+          job.state = job.state === "Ready" ? "Discarded" : "Cancelled";
+      }
+      owner.lastPreparation = job.retain();
       if (owner.autoApply?.job === job) owner.autoApply.cancelled = true;
-      job.controller.abort();
       owner.job = undefined;
       owner.boundaryCheckpoint = undefined;
+      job.controller.abort();
+      if (!owned(ctx, owner) || owner.job) return;
       ctx.ui.setStatus(STATUS_KEY, undefined);
+      if (notice && owned(ctx, owner) && !owner.job) log(ctx, notice);
     };
-    const preparationReport = (owner: Owner, job: BackgroundJob) => {
+    const preparationReport = (job: PreparationRecord) => {
       const available = job.diagnostics?.report;
       const report = available
-        ? `${job.diagnosticsUnavailable ? "Final diagnostic snapshot unavailable; last available diagnostics follow.\n" : ""}${available}`
+        ? `${job.state !== "Preparing" && job.diagnosticsUnavailable ? "Final diagnostic snapshot unavailable; last available diagnostics follow.\n" : ""}${available}`
         : `${job.diagnosticContext}\nDetailed diagnostics unavailable from the loaded compaction engine (unsupported or unreadable snapshot).`;
-      owner.lastFailureReport = report;
       return report;
+    };
+    const preparationStatus = (job: PreparationRecord) =>
+      `${job.state}${job.validationFailure || job.applicationFailure ? ` — ${failureText(job.validationFailure ?? job.applicationFailure ?? "")}` : ""}`;
+    const diagnosticReports = (owner: Owner) => {
+      const active = owner.job;
+      if (active?.state === "Preparing") active.refreshDiagnostics();
+      const current = active?.retain();
+      const last = owner.lastPreparation;
+      const failed = owner.lastFailedPreparation;
+      return [
+        ...(current && current !== last
+          ? [`Current preparation (${preparationStatus(current)}):\n${preparationReport(current)}`]
+          : []),
+        ...(last
+          ? [
+              `${last === failed ? "Last failed preparation" : "Last preparation"} (${preparationStatus(last)}):\n${preparationReport(last)}`,
+            ]
+          : []),
+        ...(failed && failed !== last && failed !== current
+          ? [`Last failed preparation:\n${preparationReport(failed)}`]
+          : []),
+      ].join("\n\n");
     };
     const pause = (
       ctx: ExtensionContext,
@@ -116,7 +143,9 @@ export function createBackgroundCompactionExtension(
       const recovery =
         "Manual /compact and Pi automatic compaction remain available. Use /background-compaction resume to retry.";
       if (failedPreparation) {
-        const report = preparationReport(owner, failedPreparation);
+        owner.lastPreparation = failedPreparation.retain();
+        owner.lastFailedPreparation = owner.lastPreparation;
+        const report = preparationReport(failedPreparation);
         if (ctx.hasUI)
           ctx.ui.notify(
             `[background-compaction] Async compaction failed: ${reason}.\nWarm-ahead paused for this session. ${recovery}\n${report}`,
@@ -284,7 +313,14 @@ export function createBackgroundCompactionExtension(
         }
         if (automatic && job.applicationFailure && isCurrent() && !signal.aborted)
           pause(ctx, owner, job.applicationFailure, owner.generation, job.state === "Failed" ? job : undefined);
-        if (owner.job === job) owner.job = undefined;
+        if (owner.job === job) {
+          if (outcome.kind === "ready") owner.job = undefined;
+          else
+            cancelJob(
+              ctx,
+              job.validationFailure ?? (outcome.kind === "cancel" ? "compaction was cancelled" : undefined),
+            );
+        }
         job.controller.abort();
         ctx.ui.setStatus(STATUS_KEY, undefined);
         if (outcome.kind === "fallback" && isCurrent())
@@ -327,13 +363,13 @@ export function createBackgroundCompactionExtension(
       }
       const job = owner.job;
       const settings = runtime.get().settings;
+      if (!settings.asyncEnabled || !settings.asyncAutoApply || owner.pauseReason || !job || job.state !== "Ready")
+        return;
+      if (!job.isCurrent()) {
+        cancelJob(ctx);
+        return;
+      }
       if (
-        !settings.asyncEnabled ||
-        !settings.asyncAutoApply ||
-        owner.pauseReason ||
-        !job ||
-        job.state !== "Ready" ||
-        !job.isCurrent() ||
         !owned(ctx, owner) ||
         owner.operation ||
         owner.compactionPending ||
@@ -405,15 +441,8 @@ export function createBackgroundCompactionExtension(
         }
         if (args.trim() === "diagnostics") {
           if (!owned(ctx, owner)) return;
-          const current = owner.job?.refreshDiagnostics()?.report;
-          const reports = [
-            ...(current ? [`Current preparation:\n${current}`] : []),
-            ...(owner.lastFailureReport && owner.lastFailureReport !== current
-              ? [`Last failed preparation:\n${owner.lastFailureReport}`]
-              : []),
-          ];
           if (ctx.hasUI)
-            ctx.ui.notify(reports.join("\n\n") || "No preparation diagnostics available in this session.", "info");
+            ctx.ui.notify(diagnosticReports(owner) || "No preparation diagnostics available in this session.", "info");
           return;
         }
         const { showBackgroundCompactionMenu } = await import("./settings-menu.js");
@@ -421,10 +450,12 @@ export function createBackgroundCompactionExtension(
         await showBackgroundCompactionMenu(runtime, ctx, {
           signal: owner.controller.signal,
           isCurrent: () => owned(ctx, owner),
-          backgroundStatus: () => (owner.job?.state === "Failed" ? undefined : owner.job?.state),
+          backgroundStatus: () =>
+            owner.job?.state === "Preparing" || owner.job?.state === "Ready" ? owner.job.state : undefined,
+          lastPreparationStatus: () => (owner.lastPreparation ? preparationStatus(owner.lastPreparation) : undefined),
           preparationStatus: () =>
             owner.job?.state === "Preparing" ? owner.job.refreshDiagnostics()?.status : undefined,
-          diagnosticReport: () => owner.lastFailureReport ?? owner.job?.refreshDiagnostics()?.report,
+          diagnosticReport: () => diagnosticReports(owner),
           warmPauseReason: () =>
             owner.pauseReason ??
             (!engine ? (connectionIssue ?? "No compatible compaction engine installed.") : undefined),
@@ -579,42 +610,40 @@ export function createBackgroundCompactionExtension(
       ctx.ui.setStatus(STATUS_KEY, "Preparing compaction…");
       if (ctx.hasUI && supportsPreparationDiagnostics(preparation)) watchPreparation(ctx, owner, started);
       log(ctx, "Async compaction triggered: preparing a compaction result in the background.");
-      void started.promise.then(
-        () => {
-          if (owner.job !== started || !owned(ctx, owner) || !started.isCurrent()) return;
-          if (started.state === "Ready") {
-            ctx.ui.setStatus(STATUS_KEY, undefined);
-            if (ctx.hasUI)
-              ctx.ui.notify(
-                `[background-compaction] ${
-                  runtime.get().settings.asyncAutoApply
-                    ? "Async compaction ready: the prepared compaction will apply after the current model/tool batch, or at the next idle input boundary."
-                    : "Async compaction ready: run /compact to apply the prepared compaction. History is unchanged until compaction."
-                }`,
-                "info",
-              );
-          } else {
-            ctx.ui.setStatus(STATUS_KEY, undefined);
-            if (started.applicationFailure) pause(ctx, owner, preparationFailure(started), owner.generation, started);
-            else
-              log(
-                ctx,
-                `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.\n${preparationReport(owner, started)}`,
-              );
+      const settled = () => {
+        if (owner.job !== started || !owned(ctx, owner)) return;
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        if (owner.job !== started || !owned(ctx, owner)) return;
+        if (!started.isCurrent() || started.state === "Discarded" || started.state === "Cancelled") {
+          if (started.state === "Failed") {
+            started.state = started.controller.signal.aborted ? "Cancelled" : "Discarded";
+            started.applicationFailure = undefined;
           }
-        },
-        () => {
-          if (owner.job === started && owned(ctx, owner) && started.isCurrent()) {
-            ctx.ui.setStatus(STATUS_KEY, undefined);
-            if (started.applicationFailure) pause(ctx, owner, preparationFailure(started), owner.generation, started);
-            else
-              log(
-                ctx,
-                `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.\n${preparationReport(owner, started)}`,
-              );
-          }
-        },
-      );
+          cancelJob(ctx);
+          return;
+        }
+        if (started.state === "Ready") {
+          if (ctx.hasUI)
+            ctx.ui.notify(
+              `[background-compaction] ${
+                runtime.get().settings.asyncAutoApply
+                  ? "Async compaction ready: the prepared compaction will apply after the current model/tool batch, or at the next idle input boundary."
+                  : "Async compaction ready: run /compact to apply the prepared compaction. History is unchanged until compaction."
+              }`,
+              "info",
+            );
+        } else {
+          owner.lastPreparation = started.retain();
+          owner.lastFailedPreparation = owner.lastPreparation;
+          if (started.applicationFailure) pause(ctx, owner, preparationFailure(started), owner.generation, started);
+          else
+            log(
+              ctx,
+              `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.\n${preparationReport(started)}`,
+            );
+        }
+      };
+      void started.promise.then(settled, settled);
     });
     pi.on("session_compact", (_event, ctx) => {
       const owner = owners.get(ctx.sessionManager);
@@ -656,7 +685,11 @@ export function createBackgroundCompactionExtension(
     pi.on("session_before_switch", navigate);
     pi.on("session_before_fork", navigate);
     pi.on("session_before_tree", navigate);
-    pi.on("thinking_level_select", navigate);
+    pi.on("thinking_level_select", (_event, ctx) => {
+      const job = owners.get(ctx.sessionManager)?.job;
+      // The engine owns format-specific validity. Older engines retain their strict check.
+      if (job && !job.isCurrent()) navigate(_event, ctx);
+    });
     pi.on("model_select", navigate);
     pi.on("session_tree", navigate);
     pi.on("session_shutdown", async (_event, ctx) => {

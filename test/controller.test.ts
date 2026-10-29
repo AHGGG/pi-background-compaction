@@ -662,3 +662,195 @@ for (const logging of [true, false])
     assert.match(h.notices.at(-1) ?? "", /safe unusable-result report/);
     await h.emit("session_shutdown");
   });
+
+for (const current of [true, false])
+  for (const ready of [true, false])
+    test(`thinking selection delegates to engine validity (current=${current}, ready=${ready})`, async () => {
+      const h = fixture();
+      let finish!: (value: PreparedCheckpoint) => void;
+      let valid = true;
+      let signal!: AbortSignal;
+      h.engine.capture = () => ({
+        requestTimeoutMs: 60_000,
+        isCurrent: () => valid,
+        reason: "thinking level changed",
+        start: (guard) => {
+          signal = guard.signal;
+          return new Promise((resolve) => {
+            finish = resolve;
+          });
+        },
+      });
+      await h.emit("session_start");
+      await h.turn();
+      if (ready) {
+        finish({ usable: true } as PreparedCheckpoint);
+        await drain();
+      }
+      valid = current;
+      await h.emit("thinking_level_select");
+      assert.equal(signal.aborted, !current);
+      if (!current) {
+        const command = h.commands.get("background-compaction") as {
+          handler(args: string, ctx: unknown): Promise<void>;
+        };
+        await command.handler("diagnostics", h.ctx);
+        assert.match(h.notices.at(-1) ?? "", /Last preparation \((Discarded|Cancelled).*selection/);
+      }
+      assert.doesNotMatch(h.notices.join("\n"), /Warm-ahead paused|Async compaction failed/);
+      if (!ready) finish({ usable: true } as PreparedCheckpoint);
+      await h.emit("session_shutdown");
+    });
+
+for (const outcome of ["discarded", "cancelled"] as const)
+  test(`producer ${outcome} retains a safe reason and final report without a failure pause`, async () => {
+    const h = fixture();
+    h.settings.logCompaction = false;
+    h.engine.capture = () => ({
+      requestTimeoutMs: 60_000,
+      isCurrent: () => true,
+      diagnostics: () => ({
+        status: outcome,
+        report: "actual final report",
+        outcome,
+        reason: "captured prefix changed",
+      }),
+      start: async () => ({ usable: false, failure: "legacy fallback" }) as PreparedCheckpoint,
+    });
+    await h.emit("session_start");
+    await h.turn();
+    await drain();
+    assert.equal(h.statuses.at(-1), undefined);
+    assert.doesNotMatch(h.notices.join("\n"), /Warm-ahead paused|Async compaction failed/);
+    const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
+    await command.handler("diagnostics", h.ctx);
+    assert.match(
+      h.notices.at(-1) ?? "",
+      /Last preparation \((Discarded|Cancelled) — captured prefix changed\):\n.*\nactual final report/,
+    );
+    assert.doesNotMatch(h.notices.at(-1) ?? "", /Last failed|Final diagnostic snapshot unavailable|legacy fallback/);
+    await h.emit("session_shutdown");
+  });
+
+test("stale old-core completion clears status and retains discard instead of generic failed none", async () => {
+  const h = fixture();
+  let valid = true;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 60_000,
+    isCurrent: () => valid,
+    reason: "system prompt changed",
+    start: async () => {
+      valid = false;
+      return { usable: false, failure: "generic preparation failure" } as PreparedCheckpoint;
+    },
+  });
+  await h.emit("session_start");
+  await h.turn();
+  await drain();
+  assert.equal(h.statuses.at(-1), undefined);
+  assert.doesNotMatch(h.notices.join("\n"), /Warm-ahead paused|Async compaction failed/);
+  const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
+  await command.handler("diagnostics", h.ctx);
+  assert.match(h.notices.at(-1) ?? "", /Last preparation \(Discarded — system prompt changed\)/);
+  await h.emit("session_shutdown");
+});
+
+test("new current preparation and retained failure are reported separately", async () => {
+  const h = fixture();
+  let first = true;
+  const original = h.engine.capture;
+  h.engine.capture = (ctx) =>
+    first
+      ? {
+          requestTimeoutMs: 60_000,
+          isCurrent: () => true,
+          diagnostics: () => ({ status: "failed", report: "old failure report" }),
+          start: async () => ({ usable: false, failure: "provider failure" }) as PreparedCheckpoint,
+        }
+      : (() => {
+          const preparation = original(ctx);
+          assert.ok(preparation);
+          return { ...preparation, diagnostics: () => ({ status: "ready", report: "new current report" }) };
+        })();
+  await h.emit("session_start");
+  await h.turn();
+  await drain();
+  const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
+  await command.handler("resume", h.ctx);
+  first = false;
+  await h.turn();
+  await drain();
+  await command.handler("diagnostics", h.ctx);
+  const notice = h.notices.at(-1) ?? "";
+  assert.match(
+    notice,
+    /Current preparation \(Ready\):[\s\S]*new current report[\s\S]*Last failed preparation \(Failed/,
+  );
+  assert.match(notice, /old failure report/);
+  await h.emit("session_shutdown");
+});
+
+test("clearing an old preparation status cannot cancel a replacement session's job", async () => {
+  const h = fixture();
+  const capture = h.engine.capture;
+  let first = true;
+  h.engine.capture = (ctx) => {
+    if (!first) return capture(ctx);
+    first = false;
+    return {
+      requestTimeoutMs: 60_000,
+      isCurrent: () => false,
+      reason: "old captured prefix changed",
+      start: async () => ({ usable: false }) as PreparedCheckpoint,
+    };
+  };
+  await h.emit("session_start");
+  const setStatus = h.ctx.ui.setStatus;
+  let replaced = false;
+  let replacement: Promise<unknown> | undefined;
+  h.ctx.ui.setStatus = (key, status) => {
+    setStatus(key, status);
+    if (status === undefined && !replaced) {
+      replaced = true;
+      void h.emit("session_start");
+      replacement = h.turn();
+    }
+  };
+  await h.turn();
+  await drain();
+  await replacement;
+  await drain();
+  const command = h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> };
+  await command.handler("diagnostics", h.ctx);
+  assert.match(h.notices.at(-1) ?? "", /Current preparation \(Ready\)/);
+  assert.doesNotMatch(h.notices.at(-1) ?? "", /Discarded|Cancelled|old captured prefix/);
+  await h.emit("session_shutdown");
+});
+
+test("idle input validates an eligible ready snapshot once and skips validation when auto-apply is off", async () => {
+  const h = fixture();
+  const capture = h.engine.capture;
+  let validations = 0;
+  h.engine.capture = (ctx) => {
+    const preparation = capture(ctx);
+    assert.ok(preparation);
+    return {
+      ...preparation,
+      isCurrent: () => {
+        validations++;
+        return true;
+      },
+    };
+  };
+  await h.emit("session_start");
+  await h.turn();
+  await drain();
+  validations = 0;
+  await h.emit("input");
+  assert.equal(validations, 1);
+  h.settings.asyncAutoApply = false;
+  validations = 0;
+  await h.emit("input");
+  assert.equal(validations, 0);
+  await h.emit("session_shutdown");
+});

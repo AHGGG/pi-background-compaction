@@ -96,6 +96,10 @@ for (const event of [
     await h.emit("session_start", {});
     await h.start();
     await h.started;
+    if (event === "thinking_level_select") {
+      h.rawPi.setThinkingLevel("high");
+      h.manager.appendThinkingLevelChange("high");
+    }
     await h.emit(event, event === "model_select" ? { model } : { aborted: true });
     assert.equal(h.requestSignals[0].aborted, true);
     h.release();

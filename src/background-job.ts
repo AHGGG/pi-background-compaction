@@ -9,21 +9,26 @@ import type {
 import { type BackgroundCompactionSettingsRuntime, compactionSettingsKey } from "./settings.js";
 import { BACKGROUND_COMPACTION_VERSION } from "./version.js";
 
-/** Controller-owned lifetime. Engines return opaque results, never schedule jobs. */
-export interface BackgroundJob {
-  controller: AbortController;
-  promise: Promise<PreparedCheckpoint>;
-  state: "Preparing" | "Ready" | "Failed";
-  isCurrent(): boolean;
-  /** Cheap lifetime/settings check only; never rebuilds the engine snapshot. */
-  isProgressCurrent(): boolean;
+/** Small retained metadata only; never retains the producer, promise, history or checkpoint. */
+export interface PreparationRecord {
+  state: "Preparing" | "Ready" | "Failed" | "Discarded" | "Cancelled";
   validationFailure?: string;
   applicationFailure?: string;
   elapsedMs?: number;
   diagnostics?: PreparationDiagnostics;
   diagnosticsUnavailable?: boolean;
   diagnosticContext: string;
+}
+
+/** Controller-owned lifetime. Engines return opaque results, never schedule jobs. */
+export interface BackgroundJob extends PreparationRecord {
+  controller: AbortController;
+  promise: Promise<PreparedCheckpoint>;
+  isCurrent(): boolean;
+  /** Cheap lifetime/settings check only; never rebuilds the engine snapshot. */
+  isProgressCurrent(): boolean;
   refreshDiagnostics(): PreparationDiagnostics | undefined;
+  retain(): PreparationRecord;
 }
 
 export function startBackgroundJob(
@@ -46,17 +51,38 @@ export function startBackgroundJob(
     () => deadline.abort(new Error("Background compaction request timed out")),
     preparation.requestTimeoutMs,
   );
+  let producerSettled = false;
+  let retained: PreparationRecord | undefined;
+  const captureDiagnostics = () => {
+    const snapshot = readPreparationDiagnostics(preparation);
+    job.diagnosticsUnavailable = !snapshot || !producerSettled;
+    if (snapshot)
+      job.diagnostics = { ...snapshot, report: `${job.diagnosticContext}\n${snapshot.report}`.slice(0, 16_384) };
+    if (retained) {
+      retained.diagnostics = job.diagnostics;
+      retained.diagnosticsUnavailable = job.diagnosticsUnavailable;
+    }
+  };
   const job: BackgroundJob = {
     controller,
     state: "Preparing",
     diagnosticContext: `companion=${BACKGROUND_COMPACTION_VERSION} background=${settings.asyncEnabled ? "on" : "off"} threshold=${settings.asyncThresholdPercent}% autoApply=${settings.asyncAutoApply ? "on" : "off"} lifecycleLogs=${settings.logCompaction ? "on" : "off"}`,
     promise: undefined as unknown as Promise<PreparedCheckpoint>,
+    retain() {
+      retained ??= { state: job.state, diagnosticContext: job.diagnosticContext };
+      Object.assign(retained, {
+        state: job.state,
+        validationFailure: job.validationFailure,
+        applicationFailure: job.applicationFailure,
+        elapsedMs: job.elapsedMs,
+        diagnostics: job.diagnostics,
+        diagnosticsUnavailable: job.diagnosticsUnavailable,
+      });
+      return retained;
+    },
     refreshDiagnostics() {
       if (job.state === "Preparing") {
-        const snapshot = readPreparationDiagnostics(preparation);
-        job.diagnosticsUnavailable = !snapshot;
-        if (snapshot)
-          job.diagnostics = { ...snapshot, report: `${job.diagnosticContext}\n${snapshot.report}`.slice(0, 16_384) };
+        captureDiagnostics();
       }
       return job.diagnostics;
     },
@@ -65,7 +91,7 @@ export function startBackgroundJob(
     },
     isCurrent() {
       const reason = signal.aborted
-        ? "background job was cancelled"
+        ? (job.validationFailure ?? "background job was cancelled")
         : !ownsSession()
           ? "session ownership changed"
           : compactionSettingsKey(runtime.get().settings) !== settingsKey
@@ -81,31 +107,48 @@ export function startBackgroundJob(
   // longer belong to the initiating run: Escape cannot invalidate completed work.
   try {
     const requestSignal = signal;
-    job.promise = abortable(
-      preparation.start({
-        signal: requestSignal,
-        deadlineSignal: deadline.signal,
-        isCurrent: () => job.isCurrent(),
-        ownsStatus: () => false,
-        failureReportOwner: "consumer",
-      }),
-      requestSignal,
-    );
+    const request = preparation.start({
+      signal: requestSignal,
+      deadlineSignal: deadline.signal,
+      isCurrent: () => job.isCurrent(),
+      ownsStatus: () => false,
+      failureReportOwner: "consumer",
+    });
+    // Cancellation bounds the consumer even if a producer ignores its signal.
+    // Only the producer's settlement makes its diagnostics a final snapshot.
+    const settled = () => {
+      producerSettled = true;
+      captureDiagnostics();
+    };
+    void request.then(settled, settled);
+    job.promise = abortable(request, requestSignal);
   } catch (error) {
+    producerSettled = true;
     job.promise = Promise.reject(error);
   }
   job.promise = job.promise
     .then(
       (prepared) => {
         job.refreshDiagnostics();
-        job.state = prepared.usable ? "Ready" : "Failed";
-        job.applicationFailure = prepared.failure;
+        const outcome = job.diagnostics?.outcome;
+        job.state =
+          outcome === "discarded"
+            ? "Discarded"
+            : outcome === "cancelled"
+              ? "Cancelled"
+              : prepared.usable
+                ? "Ready"
+                : "Failed";
+        if (job.state === "Discarded" || job.state === "Cancelled")
+          job.validationFailure ??= job.diagnostics?.reason ?? preparation.reason ?? "checkpoint is no longer current";
+        else job.applicationFailure = prepared.failure;
         return prepared;
       },
       (error: unknown) => {
         job.refreshDiagnostics();
-        job.state = "Failed";
-        if (!signal.aborted)
+        job.state = signal.aborted ? "Cancelled" : "Failed";
+        if (signal.aborted) job.validationFailure ??= "background job was cancelled";
+        else
           job.applicationFailure = deadline.signal.aborted
             ? "request timed out"
             : "background preparation failed (engine returned no safe diagnostic)";

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { buildSessionContext, type CompactionEntryDraft } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CODEX_COMPACT_SETTINGS } from "@integration/engine/settings.js";
 import { test } from "vitest";
-import { assistant, fixture } from "./async-compaction-fixture.js";
+import { assistant, fixture, model } from "./async-compaction-fixture.js";
 
 const supported = "compactionMode" in DEFAULT_CODEX_COMPACT_SETTINGS;
 if (process.env.REQUIRE_TEXT_SUMMARY === "1")
@@ -139,18 +139,28 @@ test.skipIf(!supported)("manual compaction waits for the same in-flight text sum
   }
 });
 
-for (const invalidation of ["settings", "prompt", "prefix"])
+for (const invalidation of ["settings", "prefix", "model", "provider", "auth", "disabled", "tail"])
   test.skipIf(!supported)(`text summary rejects ${invalidation} changes without replacing history`, async () => {
     const h = await ready();
     try {
       if (invalidation === "settings") await h.runtime.update({ compactionMode: "provider-checkpoint" });
-      else if (invalidation === "prompt") h.setPrompt("changed system prompt");
+      else if (invalidation === "model") h.ctx.model = { ...model, id: "changed-model" };
+      else if (invalidation === "provider") h.ctx.model = { ...model, provider: "changed-provider" };
+      else if (invalidation === "auth") h.setKey("changed-key");
+      else if (invalidation === "disabled") await h.runtime.update({ enabled: false });
+      else if (invalidation === "tail")
+        h.manager.appendMessage({
+          ...assistant(""),
+          content: [{ type: "toolCall", id: "unpaired", name: "read", arguments: {} }],
+        });
       else h.manager.appendContextEdit(h.first, { content: "edited captured history" });
       const before = JSON.stringify(h.manager.getBranch());
       h.ctx.compact = () => {
         throw new Error("Invalid result must not apply");
       };
-      await h.emit("input", {});
+      h.ctx.getContextUsage = () => ({ tokens: 0, contextWindow: 100_000, percent: 0 });
+      const result = await h.emit("turn_end", { outcome: "completed", entries: [] });
+      assert.equal(result, undefined);
       assert.equal(JSON.stringify(h.manager.getBranch()), before);
       assert.equal(h.fetches, 1);
     } finally {
@@ -223,6 +233,93 @@ test.skipIf(!supported)("text summary auto-applies without a newly appended tail
     assert.equal(h.fetches, 1);
     assert.equal(h.notifications.filter(({ message }) => message.includes("committed at")).length, 1);
   } finally {
+    await h.emit("session_shutdown", {});
+  }
+});
+
+for (const change of ["prompt", "tools", "thinking"] as const)
+  for (const phase of ["preparing", "ready"] as const)
+    for (const boundary of ["turn_end", "input"] as const)
+      test.skipIf(!supported)(
+        `text summary survives ${change} during ${phase} and applies at ${boundary}`,
+        async () => {
+          const h = textFixture();
+          try {
+            await h.emit("session_start", {});
+            await h.start();
+            await h.started;
+            if (phase === "ready") {
+              h.release();
+              await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+            if (change === "prompt") h.setPrompt("new system prompt for future requests");
+            if (change === "tools") h.rawPi.setActiveTools(["read"]);
+            if (change === "thinking") {
+              h.rawPi.setThinkingLevel("high");
+              h.manager.appendThinkingLevelChange("high");
+              await h.emit("thinking_level_select", { thinkingLevel: "high", previousThinkingLevel: "off" });
+            }
+            await h.emit("context", { messages: buildSessionContext(h.manager.getBranch()).messages });
+            if (phase === "preparing") assert.equal(h.requestSignals[0].aborted, false);
+            if (phase === "preparing") {
+              h.release();
+              await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+            appendTail(h);
+            if (boundary === "turn_end") {
+              h.ctx.isIdle = () => false;
+              const result = (await h.emit("turn_end", { outcome: "completed", entries: [] })) as {
+                entries: CompactionEntryDraft[];
+              };
+              assert.equal(result.entries.length, 1);
+              commit(h, result.entries[0]);
+              await h.emit("turn_start", {});
+            } else {
+              h.ctx.compact = (options) => {
+                void h
+                  .compact("manual")
+                  .then(async (result) => {
+                    const draft = (result as { compaction: CompactionEntryDraft }).compaction;
+                    commit(h, draft);
+                    await h.emit("session_compact", { reason: "manual", fromExtension: true });
+                    options?.onComplete?.(draft);
+                  })
+                  .catch((error) => options?.onError?.(error));
+              };
+              await h.emit("input", {});
+            }
+            assertRetained(h);
+            assert.doesNotMatch(
+              h.notifications.map(({ message }) => message).join("\n"),
+              /discarded|cancelled|Warm-ahead paused/,
+            );
+          } finally {
+            h.release();
+            await h.emit("session_shutdown", {});
+          }
+        },
+      );
+
+test.skipIf(!supported)("stale in-flight text summary retains terminal diagnostics and does not pause", async () => {
+  const h = textFixture();
+  try {
+    await h.emit("session_start", {});
+    await h.start();
+    await h.started;
+    h.manager.appendContextEdit(h.first, { content: "changed captured history" });
+    h.release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const messages = h.notifications.map(({ message }) => message).join("\n");
+    assert.doesNotMatch(messages, /Warm-ahead paused|Async compaction failed/);
+    await h.commands.get("background-compaction")?.handler("diagnostics", h.ctx);
+    const retained = h.notifications.at(-1)?.message ?? "";
+    assert.match(retained, /Last preparation \((Discarded|Cancelled)/);
+    assert.match(retained, /captured prefix changed|snapshot.*changed/);
+    assert.match(retained, /outcome=discarded/);
+    assert.doesNotMatch(retained, /outcome=failed|Final diagnostic snapshot unavailable/);
+    assert.equal(h.fetches, 1);
+  } finally {
+    h.release();
     await h.emit("session_shutdown", {});
   }
 });

@@ -29,6 +29,10 @@ export function readPreparationDiagnostics(preparation: CheckpointPreparation): 
         .join("\n")
         .trim(),
       ...(typeof snapshot.warning === "string" ? { warning: safeLine(snapshot.warning, 512) } : {}),
+      ...(["failed", "prepared", "ready", "recovered", "discarded", "cancelled"].includes(snapshot.outcome ?? "")
+        ? { outcome: snapshot.outcome }
+        : {}),
+      ...(typeof snapshot.reason === "string" ? { reason: safeLine(snapshot.reason, 512) } : {}),
     };
   } catch {
     // Optional diagnostics must never fail the preparation or expose a raw engine exception.

@@ -31,7 +31,24 @@ test("old, malformed, and throwing diagnostics never expose exceptions or break 
       diagnostics() {
         throw new Error("PRIVATE-CREDENTIAL");
       },
-    } as CheckpointPreparation),
+    } as unknown as CheckpointPreparation),
     undefined,
   );
+});
+
+test("optional terminal metadata is allowlisted and terminal-safe without parsing private report formats", () => {
+  const snapshot = readPreparationDiagnostics({
+    diagnostics: () => ({
+      status: "done",
+      report: "arbitrary report",
+      outcome: "discarded",
+      reason: "system\nchanged\u202e",
+    }),
+  } as CheckpointPreparation);
+  assert.equal(snapshot?.outcome, "discarded");
+  assert.equal(snapshot?.reason, "system changed");
+  const unknown = readPreparationDiagnostics({
+    diagnostics: () => ({ status: "done", report: "safe", outcome: "unknown" }),
+  } as unknown as CheckpointPreparation);
+  assert.equal(unknown?.outcome, undefined);
 });
