@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.0](https://github.com/AHGGG/pi-background-compaction/compare/v0.2.1...v0.3.0) (2026-10-31)
+
+
+### Features
+
+* retry transient background preparation once by default ([7d95cf4](https://github.com/AHGGG/pi-background-compaction/commit/7d95cf439e8fbb896f3771066907e4e0d8f3b319))
+* support text summary preparation with existing auto-apply ([1f930ff](https://github.com/AHGGG/pi-background-compaction/commit/1f930ffd2b0b4a06244f56f9f06c8ec83c150dcf))
+
+
+### Bug Fixes
+
+* include full diagnostics in background failure warnings ([2cfad9e](https://github.com/AHGGG/pi-background-compaction/commit/2cfad9ee54d91fc4af7eb49a1ad4709827617b4c))
+* preserve background preparation across model errors ([2697c02](https://github.com/AHGGG/pi-background-compaction/commit/2697c02a9fa512d25f28316ebee826164c1973c9))
+* preserve summary candidates and terminal preparation outcomes ([041afea](https://github.com/AHGGG/pi-background-compaction/commit/041afea4479f4962a24cf9c21be963fae69a9202))
+
 ## [0.2.1](https://github.com/AHGGG/pi-background-compaction/compare/v0.2.0...v0.2.1) (2026-10-26)
 
 
