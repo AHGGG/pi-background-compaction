@@ -1003,3 +1003,132 @@ for (const cancellation of [
       assert.match(h.notices.join("\n"), /main run was cancelled/);
     await h.emit("session_shutdown");
   });
+
+test("retry exhaustion pauses once and completed turns do not reset its budget", async () => {
+  vi.useFakeTimers();
+  const h = fixture();
+  let starts = 0;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 60_000,
+    isCurrent: () => true,
+    start: async () => {
+      starts++;
+      return {
+        usable: false,
+        retryable: true,
+        retry: () => h.engine.capture(h.ctx),
+        failure: "temporary network failure",
+      } as PreparedCheckpoint;
+    },
+  });
+  try {
+    await h.emit("session_start");
+    await h.turn();
+    await vi.advanceTimersByTimeAsync(15_000);
+    assert.equal(starts, 2);
+    assert.equal(h.notices.filter((text) => text.includes("Warm-ahead paused")).length, 1);
+    await h.turn();
+    await h.turn();
+    await vi.advanceTimersByTimeAsync(60_000);
+    assert.equal(starts, 2);
+    assert.equal(h.notices.filter((text) => text.includes("Warm-ahead paused")).length, 1);
+  } finally {
+    await h.emit("session_shutdown");
+    vi.useRealTimers();
+  }
+});
+
+test("manual compact during retry backoff waits for the same job without duplicate inference", async () => {
+  vi.useFakeTimers();
+  const h = fixture();
+  let starts = 0;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 60_000,
+    isCurrent: () => true,
+    start: async () => {
+      starts++;
+      return starts === 1
+        ? ({
+            usable: false,
+            retryable: true,
+            retry: () => h.engine.capture(h.ctx),
+            failure: "temporary",
+          } as PreparedCheckpoint)
+        : ({
+            usable: true,
+            adopt: async () => ({
+              kind: "ready",
+              result: { compaction: { summary: "summary", firstKeptEntryId: "entry", tokensBefore: 70 } },
+            }),
+          } as PreparedCheckpoint);
+    },
+  });
+  try {
+    await h.emit("session_start");
+    await h.turn();
+    await vi.advanceTimersByTimeAsync(0);
+    let finished = false;
+    const controller = new AbortController();
+    const source = h.source;
+    assert.ok(source);
+    const pending = source
+      .beforeCompact({ reason: "manual", signal: controller.signal } as never, h.ctx, {
+        signal: controller.signal,
+        isCurrent: () => true,
+      })
+      .then((result) => {
+        finished = true;
+        return result;
+      });
+    await vi.advanceTimersByTimeAsync(4999);
+    assert.equal(finished, false);
+    assert.equal(starts, 1);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal((await pending).kind, "ready");
+    assert.equal(starts, 2);
+  } finally {
+    await h.emit("session_shutdown");
+    vi.useRealTimers();
+  }
+});
+
+for (const action of ["manual-cancel", "session_before_switch", "model_select", "session_shutdown"])
+  test(`${action} cancels pending retry without replacement`, async () => {
+    vi.useFakeTimers();
+    const h = fixture();
+    let starts = 0;
+    h.engine.capture = () => ({
+      requestTimeoutMs: 60_000,
+      isCurrent: () => true,
+      start: async () => {
+        starts++;
+        return { usable: false, retryable: true, retry: () => h.engine.capture(h.ctx) } as PreparedCheckpoint;
+      },
+    });
+    try {
+      await h.emit("session_start");
+      await h.turn();
+      await vi.advanceTimersByTimeAsync(0);
+      if (action === "manual-cancel") {
+        const controller = new AbortController();
+        const source = h.source;
+        assert.ok(source);
+        const pending = source.beforeCompact({ reason: "manual", signal: controller.signal } as never, h.ctx, {
+          signal: controller.signal,
+          isCurrent: () => true,
+        });
+        controller.abort();
+        assert.equal((await pending).kind, "cancel");
+      } else await h.emit(action);
+      await vi.advanceTimersByTimeAsync(60_000);
+      assert.equal(starts, 1);
+      assert.equal(
+        h.notices.some((text) => text.includes("Warm-ahead paused")),
+        false,
+      );
+      assert.equal(h.statuses.at(-1), undefined);
+    } finally {
+      await h.emit("session_shutdown");
+      vi.useRealTimers();
+    }
+  });

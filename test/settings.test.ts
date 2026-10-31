@@ -33,6 +33,7 @@ test("defaults enable preparation, application and notices at 70%; validation re
     asyncAutoApply: true,
     logCompaction: true,
     asyncThresholdPercent: 70,
+    asyncRetryCount: 1,
   });
   assert.deepEqual(normalizeBackgroundCompactionSettings({}), DEFAULT_BACKGROUND_COMPACTION_SETTINGS);
   for (const field of ["asyncEnabled", "asyncAutoApply", "logCompaction"]) {
@@ -43,6 +44,10 @@ test("defaults enable preparation, application and notices at 70%; validation re
     assert.equal(normalizeBackgroundCompactionSettings({ asyncThresholdPercent: value }), undefined);
   for (const value of [1, 65, 99])
     assert.equal(normalizeBackgroundCompactionSettings({ asyncThresholdPercent: value })?.asyncThresholdPercent, value);
+  for (const value of [-1, 6, 1.5, NaN, Infinity, "2", null])
+    assert.equal(normalizeBackgroundCompactionSettings({ asyncRetryCount: value }), undefined);
+  for (const value of [0, 2, 5])
+    assert.equal(normalizeBackgroundCompactionSettings({ asyncRetryCount: value })?.asyncRetryCount, value);
   assert.equal(normalizeBackgroundCompactionSettings([]), undefined);
   assert.equal(normalizeBackgroundCompactionSettings(null), undefined);
 });
@@ -82,6 +87,7 @@ test("read-only legacy fallback preserves all owned opt-ins without copying prov
   const loaded = await runtime.reload();
   assert.equal(loaded.source, "legacy");
   assert.deepEqual(loaded.settings, {
+    asyncRetryCount: 1,
     asyncEnabled: true,
     asyncAutoApply: true,
     asyncThresholdPercent: 75,
@@ -219,9 +225,9 @@ for (const source of ["canonical", "legacy"] as const) {
     const saved = { asyncEnabled: false, asyncAutoApply: false, logCompaction: false, asyncThresholdPercent: 65 };
     await writeFile(input, JSON.stringify(saved));
     const runtime = createBackgroundCompactionSettingsRuntime(path);
-    assert.deepEqual((await runtime.reload()).settings, saved);
+    assert.deepEqual((await runtime.reload()).settings, { ...saved, asyncRetryCount: 1 });
     await runtime.update({ logCompaction: true });
-    assert.deepEqual(runtime.get().settings, { ...saved, logCompaction: true });
+    assert.deepEqual(runtime.get().settings, { ...saved, logCompaction: true, asyncRetryCount: 1 });
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { ...saved, logCompaction: true });
     if (source === "legacy") {
       assert.deepEqual(JSON.parse(await readFile(input, "utf8")), saved);

@@ -77,6 +77,8 @@ export function fixture(overrides = {}, order: "core-first" | "background-first"
       asyncAutoApply: false,
       logCompaction: false,
       asyncThresholdPercent: 65,
+      // Existing integration cases exercise one preparation; retry cases opt in explicitly.
+      asyncRetryCount: 0,
       ...overrides,
     },
     document: {},

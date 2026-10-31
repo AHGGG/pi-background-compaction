@@ -8,7 +8,7 @@ import type {
 import { terminalText as safeText } from "./terminal.js";
 
 type Screen = "main" | "settings" | "status" | "help" | "invalid";
-type Action = "resume" | "set-enabled" | "set-auto-apply" | "set-threshold" | "set-log";
+type Action = "resume" | "set-enabled" | "set-auto-apply" | "set-threshold" | "set-retries" | "set-log";
 
 export interface SettingsMenuOwner {
   signal: AbortSignal;
@@ -61,6 +61,7 @@ export function createBackgroundCompactionMenu(
   const status = (state: Readonly<BackgroundCompactionSettingsState>) => [
     `Background preparation: ${state.settings.asyncEnabled ? `On · ${state.settings.asyncThresholdPercent}%` : "Off"}`,
     `Apply when ready: ${state.settings.asyncAutoApply ? "On" : "Off"}`,
+    `Automatic retries: ${state.settings.asyncRetryCount} after the initial attempt`,
     `Lifecycle logs: ${state.settings.logCompaction ? "On" : "Off"}`,
     `Prepared compaction: ${options.backgroundStatus?.() ?? "none"}`,
     ...(options.lastPreparationStatus?.()
@@ -127,6 +128,15 @@ export function createBackgroundCompactionMenu(
             action: "set-threshold",
           },
           {
+            id: "asyncRetryCount",
+            label: "Automatic retries",
+            description:
+              "Retry transient preparation failures after 5s, then 10s (capped at 30s). 0 disables retries; may consume extra quota.",
+            currentValue: String(state.settings.asyncRetryCount),
+            values: ["0", "1", "2", "3", "4", "5"],
+            action: "set-retries",
+          },
+          {
             id: "logCompaction",
             label: "Lifecycle logs",
             description: "Show background preparation and application notices in TUI and RPC.",
@@ -154,6 +164,8 @@ export function createBackgroundCompactionMenu(
           "Requires a compatible prepared-compaction engine extension; it does not perform provider requests by itself.",
           "Background preparation and Apply when ready are on by default. Choose the output format in the engine settings.",
           "A prepared compaction result applies only at a safe Pi boundary. Manual /compact remains available.",
+          "Default: 1 automatic retry after the initial attempt, within the original preparation deadline.",
+          "Only producer-confirmed transient failures retry; cancellation, stale state and unclassified failures do not.",
           "Use /background-compaction resume to clear a session-only failure pause.",
           "Failures print a complete report when the engine supports diagnostics; /background-compaction diagnostics shows retained reports.",
           "Preparation progress and inactivity advisories do not change the request deadline.",
@@ -181,6 +193,7 @@ export function createBackgroundCompactionMenu(
       "set-auto-apply": ({ ctx, value, signal }) => save(ctx, { asyncAutoApply: value === "On" }, signal),
       "set-threshold": ({ ctx, value, signal }) =>
         save(ctx, { asyncThresholdPercent: Number.parseInt(value ?? "65", 10) }, signal),
+      "set-retries": ({ ctx, value, signal }) => save(ctx, { asyncRetryCount: Number(value) }, signal),
       "set-log": ({ ctx, value, signal }) => save(ctx, { logCompaction: value === "On" }, signal),
     },
   };

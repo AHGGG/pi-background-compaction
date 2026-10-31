@@ -18,6 +18,9 @@ export interface PreparationRecord {
   diagnostics?: PreparationDiagnostics;
   diagnosticsUnavailable?: boolean;
   diagnosticContext: string;
+  retryCount?: number;
+  attempt?: number;
+  retryDelayMs?: number;
 }
 
 /** Controller-owned lifetime. Engines return opaque results, never schedule jobs. */
@@ -37,6 +40,10 @@ export function startBackgroundJob(
   runtime: BackgroundCompactionSettingsRuntime,
   ownerSignal: AbortSignal,
   ownsSession: () => boolean,
+  retry?: {
+    onRetry(count: number, delayMs: number): void;
+    onAttempt(count: number): void;
+  },
 ): BackgroundJob {
   const started = performance.now();
   const controller = new AbortController();
@@ -46,6 +53,7 @@ export function startBackgroundJob(
   const runSignal = ctx.signal;
   const cancelPreparing = () => controller.abort();
   runSignal?.addEventListener("abort", cancelPreparing, { once: true });
+  if (runSignal?.aborted) controller.abort();
   const deadline = new AbortController();
   const timeout = setTimeout(
     () => deadline.abort(new Error("Background compaction request timed out")),
@@ -57,7 +65,10 @@ export function startBackgroundJob(
     const snapshot = readPreparationDiagnostics(preparation);
     job.diagnosticsUnavailable = !snapshot || !producerSettled;
     if (snapshot)
-      job.diagnostics = { ...snapshot, report: `${job.diagnosticContext}\n${snapshot.report}`.slice(0, 16_384) };
+      job.diagnostics = {
+        ...snapshot,
+        report: `${job.diagnosticContext} attempt=${job.attempt ?? 1}\n${snapshot.report}`.slice(0, 16_384),
+      };
     if (retained) {
       retained.diagnostics = job.diagnostics;
       retained.diagnosticsUnavailable = job.diagnosticsUnavailable;
@@ -66,7 +77,7 @@ export function startBackgroundJob(
   const job: BackgroundJob = {
     controller,
     state: "Preparing",
-    diagnosticContext: `companion=${BACKGROUND_COMPACTION_VERSION} background=${settings.asyncEnabled ? "on" : "off"} threshold=${settings.asyncThresholdPercent}% autoApply=${settings.asyncAutoApply ? "on" : "off"} lifecycleLogs=${settings.logCompaction ? "on" : "off"}`,
+    diagnosticContext: `companion=${BACKGROUND_COMPACTION_VERSION} background=${settings.asyncEnabled ? "on" : "off"} threshold=${settings.asyncThresholdPercent}% autoApply=${settings.asyncAutoApply ? "on" : "off"} lifecycleLogs=${settings.logCompaction ? "on" : "off"} retryLimit=${settings.asyncRetryCount}`,
     promise: undefined as unknown as Promise<PreparedCheckpoint>,
     retain() {
       retained ??= { state: job.state, diagnosticContext: job.diagnosticContext };
@@ -77,6 +88,9 @@ export function startBackgroundJob(
         elapsedMs: job.elapsedMs,
         diagnostics: job.diagnostics,
         diagnosticsUnavailable: job.diagnosticsUnavailable,
+        retryCount: job.retryCount,
+        attempt: job.attempt,
+        retryDelayMs: job.retryDelayMs,
       });
       return retained;
     },
@@ -103,29 +117,76 @@ export function startBackgroundJob(
       return reason === undefined;
     },
   };
-  // Capture is synchronous, and the request begins immediately. Ready results no
-  // longer belong to the initiating run: Escape cannot invalidate completed work.
-  try {
-    const requestSignal = signal;
-    const request = preparation.start({
-      signal: requestSignal,
-      deadlineSignal: deadline.signal,
-      isCurrent: () => job.isCurrent(),
-      ownsStatus: () => false,
-      failureReportOwner: "consumer",
-    });
-    // Cancellation bounds the consumer even if a producer ignores its signal.
-    // Only the producer's settlement makes its diagnostics a final snapshot.
-    const settled = () => {
-      producerSettled = true;
+  // One promise owns the entire bounded retry sequence. Foreground compaction
+  // waits on this same promise; it never races a separately scheduled retry.
+  const run = async (): Promise<PreparedCheckpoint> => {
+    for (;;) {
+      if (!job.isCurrent() || deadline.signal.aborted) throw new Error("Background preparation is no longer current");
+      producerSettled = false;
+      const request = preparation.start({
+        signal,
+        deadlineSignal: deadline.signal,
+        isCurrent: () => job.isCurrent(),
+        ownsStatus: () => false,
+        failureReportOwner: "consumer",
+      });
+      const settled = () => {
+        producerSettled = true;
+        captureDiagnostics();
+      };
+      void request.then(settled, settled);
+      const prepared = await abortable(request, signal);
       captureDiagnostics();
-    };
-    void request.then(settled, settled);
-    job.promise = abortable(request, requestSignal);
-  } catch (error) {
-    producerSettled = true;
-    job.promise = Promise.reject(error);
-  }
+      const outcome = job.diagnostics?.outcome;
+      const count = job.retryCount ?? 0;
+      if (
+        prepared.usable ||
+        prepared.retryable !== true ||
+        typeof prepared.retry !== "function" ||
+        outcome === "cancelled" ||
+        outcome === "discarded" ||
+        !retry ||
+        count >= settings.asyncRetryCount ||
+        deadline.signal.aborted ||
+        !job.isCurrent()
+      )
+        return prepared;
+      const delayMs = Math.min(5_000 * 2 ** count, 30_000);
+      job.retryCount = count + 1;
+      job.retryDelayMs = delayMs;
+      retry.onRetry(count + 1, delayMs);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await abortable(
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, delayMs);
+          }),
+          AbortSignal.any([signal, deadline.signal]),
+        );
+      } catch (error) {
+        if (deadline.signal.aborted && !signal.aborted) return prepared;
+        throw error;
+      } finally {
+        clearTimeout(timer);
+        job.retryDelayMs = undefined;
+      }
+      if (deadline.signal.aborted || !job.isCurrent()) return prepared;
+      const retrySignal = AbortSignal.any([signal, deadline.signal]);
+      const next = prepared.retry({
+        signal: retrySignal,
+        isCurrent: () => !deadline.signal.aborted && job.isCurrent(),
+      });
+      // Producer-owned recapture preserves its original authentication binding.
+      // Recapture and status callbacks can reenter; recheck ownership before start.
+      if (!next || !job.isCurrent() || !next.isCurrent() || deadline.signal.aborted) return prepared;
+      preparation = next;
+      job.attempt = count + 2;
+      job.diagnostics = undefined;
+      job.diagnosticsUnavailable = true;
+      retry.onAttempt(count + 1);
+    }
+  };
+  job.promise = run();
   job.promise = job.promise
     .then(
       (prepared) => {

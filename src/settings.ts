@@ -12,11 +12,12 @@ export interface BackgroundCompactionSettings {
   asyncAutoApply: boolean;
   logCompaction: boolean;
   asyncThresholdPercent: number;
+  asyncRetryCount: number;
 }
 
 /** Logging and application timing do not invalidate prepared work. */
 export function compactionSettingsKey(settings: BackgroundCompactionSettings): string {
-  return JSON.stringify([settings.asyncEnabled, settings.asyncThresholdPercent]);
+  return JSON.stringify([settings.asyncEnabled, settings.asyncThresholdPercent, settings.asyncRetryCount]);
 }
 
 export const DEFAULT_BACKGROUND_COMPACTION_SETTINGS: Readonly<BackgroundCompactionSettings> = Object.freeze({
@@ -24,6 +25,7 @@ export const DEFAULT_BACKGROUND_COMPACTION_SETTINGS: Readonly<BackgroundCompacti
   asyncAutoApply: true,
   logCompaction: true,
   asyncThresholdPercent: 70,
+  asyncRetryCount: 1,
 });
 
 export interface BackgroundCompactionSettingsState {
@@ -63,7 +65,19 @@ export function normalizeBackgroundCompactionSettings(value: unknown): Backgroun
       value.asyncThresholdPercent > 99)
   )
     return undefined;
+  if (
+    Object.hasOwn(value, "asyncRetryCount") &&
+    (typeof value.asyncRetryCount !== "number" ||
+      !Number.isSafeInteger(value.asyncRetryCount) ||
+      value.asyncRetryCount < 0 ||
+      value.asyncRetryCount > 5)
+  )
+    return undefined;
   return {
+    asyncRetryCount:
+      typeof value.asyncRetryCount === "number"
+        ? value.asyncRetryCount
+        : DEFAULT_BACKGROUND_COMPACTION_SETTINGS.asyncRetryCount,
     asyncEnabled:
       typeof value.asyncEnabled === "boolean"
         ? value.asyncEnabled

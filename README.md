@@ -95,23 +95,28 @@ Settings are stored in `pi-background-compaction.json` inside Pi's agent directo
 | `asyncEnabled` | `true` | Allow background checkpoint preparation. |
 | `asyncAutoApply` | `true` | Apply ready checkpoints without waiting for ordinary compaction. Requires background preparation to be enabled. |
 | `asyncThresholdPercent` | `70` | Context usage percentage that allows preparation. Must be an integer from 1 to 99. |
+| `asyncRetryCount` | `1` | Automatic retries after the initial preparation attempt (2 attempts total by default). Integer 0–5; 0 disables retries. |
 | `logCompaction` | `true` | Show preparation and application notices. |
 
 Menu changes are saved and take effect immediately. Escape closes the menu; it does not undo saved changes. If you edit the file yourself, run `/reload` to load it. Invalid settings files disable background preparation and are not overwritten; repair the file and reload.
 
-These are user-level settings, with no project overrides. Provider timeouts, retries, checkpoint retention, and recovery options belong to the compaction engine, not this companion.
+These are user-level settings, with no project overrides. Provider timeouts, low-level transport retries, checkpoint retention, and recovery options belong to the compaction engine, not this companion.
 
 ### Moving from the built-in controller
 
 Background settings and the resume command have moved from `/codex-compact` to `/background-compaction`.
 
-If the new settings file does not exist, this extension reads the four settings above from the adjacent `pi-codex-compact.json`. Status shows when those legacy preferences are in use. The first explicit save in the new menu copies them into the new file, without changing the old file or copying provider credentials.
+If the new settings file does not exist, this extension reads its existing settings from the adjacent `pi-codex-compact.json`. Status shows when those legacy preferences are in use. The first explicit save in the new menu copies them into the new file, without changing the old file or copying provider credentials.
 
 Once the new file exists, it takes precedence. Explicit saved values, including `false` and older thresholds, are preserved. Missing fields in either file use the defaults above; missing fields in the new file do not fall back to the old file. Keep your old settings until you have saved the new ones.
 
 ## Failures and limits
 
-A failed preparation request pauses further preparation for the current session. Preparation failure warnings include elapsed time and a safe reason from the engine, or a generic message if no safe reason is available. Manual `/compact` and Pi's automatic compaction remain available.
+A producer-confirmed transient preparation failure is retried automatically up to `asyncRetryCount` times: after 5 seconds, then 10 seconds (later delays are capped at 30 seconds). The initial attempt and retries are sequential and share the original preparation deadline; retrying never extends that deadline. Manual `/compact` waits on the same preparation, including backoff. The engine's existing low-level transport retries still occur within each attempt, so these additional attempts can consume more provider quota.
+
+Cancellation, session/model/settings changes, stale results, permanent errors and unclassified failures do not trigger automatic retry. Engines without the optional retry hint retain the previous single-attempt behavior; update both the engine and companion to use automatic retry. Only preparation retries: checkpoint validation/application failures never launch replacement inference.
+
+After retries are exhausted, or a non-retryable preparation fails, further preparation pauses for the current session. Preparation failure warnings include elapsed time and a safe reason from the engine, or a generic message if no safe reason is available. Manual `/compact` and Pi's automatic compaction remain available.
 
 With a diagnostics-capable engine, the status line shows elapsed time and recent stream activity. An inactivity notice is only advisory: it does not cancel the request or shorten its deadline. The background failure warning itself includes a bounded diagnostic report with attempt timings and stream completion details, even when lifecycle logs are off, so you can copy that one warning without reproducing the failure. With a current engine, it replaces the engine’s separate preparation-failure report; older diagnostics-capable engines may also print their earlier report. The companion retains the last failed report for the session, including across `resume`; Status and `/background-compaction diagnostics` can show it again. Reports exclude prompts, scratchpad contents, credentials, and checkpoint bodies. If the engine cannot provide diagnostics, the same warning explicitly says so. If the final snapshot cannot be read, an available earlier snapshot is clearly labelled as last available rather than final.
 

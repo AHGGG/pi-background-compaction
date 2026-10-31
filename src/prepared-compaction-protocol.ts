@@ -32,6 +32,10 @@ export interface CheckpointDraft {
 export interface PreparedCheckpoint {
   readonly checkpointId?: string;
   readonly usable: boolean;
+  /** Explicit producer-owned transient failure hint. Missing/false must never authorize retries. */
+  readonly retryable?: boolean;
+  /** Recapture only after a transient failure; preserve original provider/authentication binding. */
+  retry?(guard: ApplicationGuard): CheckpointPreparation | undefined;
   /** Producer-filtered safe summary only: no credentials, request/response bodies, session content or stacks. */
   readonly failure?: string;
   adopt(event: SessionBeforeCompactEvent, ctx: ExtensionContext, guard: ApplicationGuard): Promise<CheckpointAdoption>;

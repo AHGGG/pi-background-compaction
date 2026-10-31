@@ -192,7 +192,12 @@ export function createBackgroundCompactionExtension(
           return;
         }
         const diagnostics = job.refreshDiagnostics();
-        if (diagnostics?.status) ctx.ui.setStatus(STATUS_KEY, diagnostics.status);
+        if (job.retryDelayMs !== undefined)
+          ctx.ui.setStatus(
+            STATUS_KEY,
+            `Compaction retry ${job.retryCount}/${runtime.get().settings.asyncRetryCount} pending…`,
+          );
+        else if (diagnostics?.status) ctx.ui.setStatus(STATUS_KEY, diagnostics.status);
         if (diagnostics?.warning && !warned) {
           warned = true;
           ctx.ui.notify(`[background-compaction] ${diagnostics.warning}`, "info");
@@ -454,7 +459,11 @@ export function createBackgroundCompactionExtension(
             owner.job?.state === "Preparing" || owner.job?.state === "Ready" ? owner.job.state : undefined,
           lastPreparationStatus: () => (owner.lastPreparation ? preparationStatus(owner.lastPreparation) : undefined),
           preparationStatus: () =>
-            owner.job?.state === "Preparing" ? owner.job.refreshDiagnostics()?.status : undefined,
+            owner.job?.state === "Preparing"
+              ? owner.job.retryDelayMs !== undefined
+                ? `Retry ${owner.job.retryCount}/${runtime.get().settings.asyncRetryCount} pending`
+                : owner.job.refreshDiagnostics()?.status
+              : undefined,
           diagnosticReport: () => diagnosticReports(owner),
           warmPauseReason: () =>
             owner.pauseReason ??
@@ -610,7 +619,21 @@ export function createBackgroundCompactionExtension(
         return;
       const preparation = engine.capture(ctx);
       if (!preparation) return;
-      const started = startBackgroundJob(preparation, ctx, runtime, owner.controller.signal, () => owned(ctx, owner));
+      const started = startBackgroundJob(preparation, ctx, runtime, owner.controller.signal, () => owned(ctx, owner), {
+        onRetry: (count, delayMs) => {
+          if (!owned(ctx, owner)) return;
+          ctx.ui.setStatus(STATUS_KEY, `Compaction retry ${count}/${settings.asyncRetryCount} in ${delayMs / 1000}s…`);
+          log(
+            ctx,
+            `Async compaction retry ${count}/${settings.asyncRetryCount} scheduled in ${delayMs / 1000}s after a transient failure. Retries may consume additional quota.`,
+          );
+        },
+        onAttempt: (count) => {
+          if (!owned(ctx, owner)) return;
+          ctx.ui.setStatus(STATUS_KEY, `Preparing compaction (retry ${count}/${settings.asyncRetryCount})…`);
+          log(ctx, `Async compaction retry ${count}/${settings.asyncRetryCount} started.`);
+        },
+      });
       owner.job = started;
       ctx.ui.setStatus(STATUS_KEY, "Preparing compaction…");
       if (ctx.hasUI && supportsPreparationDiagnostics(preparation)) watchPreparation(ctx, owner, started);

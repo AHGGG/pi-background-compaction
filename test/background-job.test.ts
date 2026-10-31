@@ -211,6 +211,7 @@ test("progress checks never revalidate the potentially large engine snapshot", a
     return true;
   };
   const job = h.start();
+  validations = 0; // Initial dispatch validates once; progress polling must remain cheap.
   assert.equal(job.isProgressCurrent(), true);
   assert.equal(job.isProgressCurrent(), true);
   assert.equal(validations, 0);
@@ -278,4 +279,238 @@ test("retained records contain metadata only and receive the producer's later fi
   await Promise.resolve();
   assert.equal(record.diagnosticsUnavailable, false);
   assert.ok(record.diagnostics?.report.endsWith("terminal report"));
+});
+
+function retryFixture(retryCount = 1) {
+  const h = fixture(60_000);
+  h.settings.asyncRetryCount = retryCount;
+  let starts = 0;
+  let captures = 0;
+  let current = true;
+  const events: string[] = [];
+  const results: PreparedCheckpoint[] = [];
+  const candidate = (): CheckpointPreparation => ({
+    requestTimeoutMs: 60_000,
+    isCurrent: () => current,
+    start: async () => {
+      starts += 1;
+      const result =
+        results.shift() ?? ({ usable: false, retryable: true, failure: "transient" } as PreparedCheckpoint);
+      return {
+        ...result,
+        retry: () => {
+          captures += 1;
+          return candidate();
+        },
+      };
+    },
+  });
+  const start = () =>
+    startBackgroundJob(
+      candidate(),
+      { signal: h.run.signal } as ExtensionContext,
+      {
+        get: () => ({ settings: h.settings }),
+      } as BackgroundCompactionSettingsRuntime,
+      h.owner.signal,
+      () => true,
+      {
+        onRetry: (count, delay) => events.push(`wait ${count} ${delay}`),
+        onAttempt: (count) => events.push(`start ${count}`),
+      },
+    );
+  return {
+    ...h,
+    start,
+    results,
+    events,
+    invalidate: () => {
+      current = false;
+    },
+    get starts() {
+      return starts;
+    },
+    get captures() {
+      return captures;
+    },
+  };
+}
+
+test("configured two retries are sequential, bounded, and keep one promise until success", async () => {
+  vi.useFakeTimers();
+  try {
+    const h = retryFixture(2);
+    h.results.push(
+      { usable: false, retryable: true } as PreparedCheckpoint,
+      { usable: false, retryable: true } as PreparedCheckpoint,
+      { usable: true } as PreparedCheckpoint,
+    );
+    const job = h.start();
+    const promise = job.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    assert.equal(h.starts, 1);
+    assert.equal(job.state, "Preparing");
+    assert.equal(job.retryDelayMs, 5000);
+    await vi.advanceTimersByTimeAsync(4999);
+    assert.equal(h.starts, 1);
+    await vi.advanceTimersByTimeAsync(1);
+    assert.equal(h.starts, 2);
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(h.starts, 3);
+    assert.equal(await promise, await job.promise);
+    assert.equal(job.state, "Ready");
+    assert.equal(h.captures, 2);
+    assert.deepEqual(h.events, ["wait 1 5000", "start 1", "wait 2 10000", "start 2"]);
+    h.run.abort();
+    assert.equal(job.isCurrent(), true);
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("exhaustion and disabled retries return the final failed handle without further attempts", async () => {
+  vi.useFakeTimers();
+  try {
+    for (const limit of [0, 1, 2]) {
+      const h = retryFixture(limit);
+      const job = h.start();
+      await vi.advanceTimersByTimeAsync(60_000);
+      const result = await job.promise;
+      assert.equal(result.usable, false);
+      assert.equal(job.state, "Failed");
+      assert.equal(h.starts, limit + 1);
+      assert.equal(vi.getTimerCount(), 0);
+    }
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+for (const retryable of [undefined, false])
+  test(`unclassified/permanent failure (${String(retryable)}) does not retry`, async () => {
+    vi.useFakeTimers();
+    try {
+      const h = retryFixture();
+      h.results.push({ usable: false, retryable } as PreparedCheckpoint);
+      const job = h.start();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await job.promise;
+      assert.equal(h.starts, 1);
+      assert.equal(h.captures, 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+for (const change of ["run", "owner", "controller", "settings", "snapshot"] as const)
+  test(`${change} during backoff prevents retry and clears timers`, async () => {
+    vi.useFakeTimers();
+    try {
+      const h = retryFixture();
+      const job = h.start();
+      const outcome = job.promise.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      if (change === "run") h.run.abort();
+      else if (change === "owner") h.owner.abort();
+      else if (change === "controller") job.controller.abort();
+      else if (change === "settings") h.settings.asyncRetryCount = 0;
+      else h.invalidate();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await outcome;
+      assert.equal(h.starts, 1);
+      assert.equal(h.captures, 0);
+      assert.equal(job.isCurrent(), false);
+      assert.equal(vi.getTimerCount(), 0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+test("retry backoff is bounded by the original total preparation deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    const h = fixture(1000);
+    h.preparation.start = async () =>
+      ({
+        usable: false,
+        retryable: true,
+        retry: () => {
+          captures += 1;
+          return h.preparation;
+        },
+      }) as PreparedCheckpoint;
+    let captures = 0;
+    const job = startBackgroundJob(
+      h.preparation,
+      { signal: h.run.signal } as ExtensionContext,
+      { get: () => ({ settings: h.settings }) } as BackgroundCompactionSettingsRuntime,
+      h.owner.signal,
+      () => true,
+      {
+        onRetry: () => {},
+        onAttempt: () => {},
+      },
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+    await job.promise;
+    assert.equal(captures, 0);
+    assert.equal(job.state, "Failed");
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a retry hint without producer-owned recapture stays single-attempt", async () => {
+  const h = fixture();
+  h.preparation.start = async () => ({ usable: false, retryable: true }) as PreparedCheckpoint;
+  let retries = 0;
+  const job = startBackgroundJob(
+    h.preparation,
+    { signal: h.run.signal } as ExtensionContext,
+    { get: () => ({ settings: h.settings }) } as BackgroundCompactionSettingsRuntime,
+    h.owner.signal,
+    () => true,
+    {
+      onRetry: () => {
+        retries++;
+      },
+      onAttempt: () => {},
+    },
+  );
+  await job.promise;
+  assert.equal(retries, 0);
+});
+
+test("reentrant cancellation from retry-start status cannot dispatch new work", async () => {
+  vi.useFakeTimers();
+  const h = fixture(60_000);
+  let starts = 0;
+  const candidate: CheckpointPreparation = {
+    requestTimeoutMs: 60_000,
+    isCurrent: () => true,
+    start: async () => {
+      starts++;
+      return { usable: false, retryable: true, retry: () => candidate } as PreparedCheckpoint;
+    },
+  };
+  try {
+    const job = startBackgroundJob(
+      candidate,
+      { signal: h.run.signal } as ExtensionContext,
+      { get: () => ({ settings: h.settings }) } as BackgroundCompactionSettingsRuntime,
+      h.owner.signal,
+      () => true,
+      { onRetry: () => {}, onAttempt: () => h.run.abort() },
+    );
+    const pending = job.promise.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(5000);
+    await pending;
+    assert.equal(starts, 1);
+    assert.equal(job.state, "Cancelled");
+    assert.equal(vi.getTimerCount(), 0);
+  } finally {
+    vi.useRealTimers();
+  }
 });
