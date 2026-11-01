@@ -34,6 +34,7 @@ test("defaults enable preparation, application and notices at 70%; validation re
     logCompaction: true,
     asyncThresholdPercent: 70,
     asyncRetryCount: 1,
+    asyncRequestSizeMiB: 13,
   });
   assert.deepEqual(normalizeBackgroundCompactionSettings({}), DEFAULT_BACKGROUND_COMPACTION_SETTINGS);
   for (const field of ["asyncEnabled", "asyncAutoApply", "logCompaction"]) {
@@ -48,6 +49,10 @@ test("defaults enable preparation, application and notices at 70%; validation re
     assert.equal(normalizeBackgroundCompactionSettings({ asyncRetryCount: value }), undefined);
   for (const value of [0, 2, 5])
     assert.equal(normalizeBackgroundCompactionSettings({ asyncRetryCount: value })?.asyncRetryCount, value);
+  for (const value of [0, 33, 13.5, NaN, Infinity, "13", null])
+    assert.equal(normalizeBackgroundCompactionSettings({ asyncRequestSizeMiB: value }), undefined);
+  for (const value of [1, 13, 32])
+    assert.equal(normalizeBackgroundCompactionSettings({ asyncRequestSizeMiB: value })?.asyncRequestSizeMiB, value);
   assert.equal(normalizeBackgroundCompactionSettings([]), undefined);
   assert.equal(normalizeBackgroundCompactionSettings(null), undefined);
 });
@@ -60,6 +65,7 @@ test("log and automatic-application toggles do not invalidate prepared work", ()
   );
   assert.notEqual(compactionSettingsKey(settings), compactionSettingsKey({ ...settings, asyncEnabled: false }));
   assert.notEqual(compactionSettingsKey(settings), compactionSettingsKey({ ...settings, asyncThresholdPercent: 75 }));
+  assert.notEqual(compactionSettingsKey(settings), compactionSettingsKey({ ...settings, asyncRequestSizeMiB: 16 }));
 });
 
 test("missing-file load is side-effect free, including a missing parent directory", async () => {
@@ -88,6 +94,7 @@ test("read-only legacy fallback preserves all owned opt-ins without copying prov
   assert.equal(loaded.source, "legacy");
   assert.deepEqual(loaded.settings, {
     asyncRetryCount: 1,
+    asyncRequestSizeMiB: 13,
     asyncEnabled: true,
     asyncAutoApply: true,
     asyncThresholdPercent: 75,
@@ -225,9 +232,14 @@ for (const source of ["canonical", "legacy"] as const) {
     const saved = { asyncEnabled: false, asyncAutoApply: false, logCompaction: false, asyncThresholdPercent: 65 };
     await writeFile(input, JSON.stringify(saved));
     const runtime = createBackgroundCompactionSettingsRuntime(path);
-    assert.deepEqual((await runtime.reload()).settings, { ...saved, asyncRetryCount: 1 });
+    assert.deepEqual((await runtime.reload()).settings, { ...saved, asyncRetryCount: 1, asyncRequestSizeMiB: 13 });
     await runtime.update({ logCompaction: true });
-    assert.deepEqual(runtime.get().settings, { ...saved, logCompaction: true, asyncRetryCount: 1 });
+    assert.deepEqual(runtime.get().settings, {
+      ...saved,
+      logCompaction: true,
+      asyncRetryCount: 1,
+      asyncRequestSizeMiB: 13,
+    });
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { ...saved, logCompaction: true });
     if (source === "legacy") {
       assert.deepEqual(JSON.parse(await readFile(input, "utf8")), saved);
@@ -292,4 +304,18 @@ test("path replacement or disappearance after open fails closed", async () => {
       mock.mockReset().mockImplementation(actual.lstat);
     }
   }
+});
+
+test("full-request threshold persists without altering unrelated settings", async () => {
+  const path = await settingsPath();
+  await writeFile(path, JSON.stringify({ asyncEnabled: false, custom: "keep" }));
+  const runtime = createBackgroundCompactionSettingsRuntime(path);
+  await runtime.reload();
+  await runtime.update({ asyncRequestSizeMiB: 16 });
+  assert.equal((await runtime.reload()).settings.asyncRequestSizeMiB, 16);
+  assert.deepEqual(JSON.parse(await readFile(path, "utf8")), {
+    asyncEnabled: false,
+    custom: "keep",
+    asyncRequestSizeMiB: 16,
+  });
 });

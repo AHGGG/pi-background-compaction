@@ -8,7 +8,7 @@ import type {
 import { terminalText as safeText } from "./terminal.js";
 
 type Screen = "main" | "settings" | "status" | "help" | "invalid";
-type Action = "resume" | "set-enabled" | "set-auto-apply" | "set-threshold" | "set-retries" | "set-log";
+type Action = "resume" | "set-enabled" | "set-auto-apply" | "set-threshold" | "set-size" | "set-retries" | "set-log";
 
 export interface SettingsMenuOwner {
   signal: AbortSignal;
@@ -60,6 +60,7 @@ export function createBackgroundCompactionMenu(
   };
   const status = (state: Readonly<BackgroundCompactionSettingsState>) => [
     `Background preparation: ${state.settings.asyncEnabled ? `On · ${state.settings.asyncThresholdPercent}%` : "Off"}`,
+    `Full-request threshold: ${state.settings.asyncRequestSizeMiB} MiB`,
     `Apply when ready: ${state.settings.asyncAutoApply ? "On" : "Off"}`,
     `Automatic retries: ${state.settings.asyncRetryCount} after the initial attempt`,
     `Lifecycle logs: ${state.settings.logCompaction ? "On" : "Off"}`,
@@ -128,6 +129,15 @@ export function createBackgroundCompactionMenu(
             action: "set-threshold",
           },
           {
+            id: "asyncRequestSizeMiB",
+            label: "Full-request size threshold",
+            description:
+              "Start after a completed turn when a compatible transport reports this full request size. Either threshold can trigger; this is not a server limit.",
+            currentValue: `${state.settings.asyncRequestSizeMiB} MiB`,
+            values: ["8 MiB", "10 MiB", "12 MiB", "13 MiB", "14 MiB", "16 MiB", "20 MiB", "24 MiB", "32 MiB"],
+            action: "set-size",
+          },
+          {
             id: "asyncRetryCount",
             label: "Automatic retries",
             description:
@@ -164,6 +174,8 @@ export function createBackgroundCompactionMenu(
           "Requires a compatible prepared-compaction engine extension; it does not perform provider requests by itself.",
           "Background preparation and Apply when ready are on by default. Choose the output format in the engine settings.",
           "A prepared compaction result applies only at a safe Pi boundary. Manual /compact remains available.",
+          "Default triggers: 70% context usage OR 13 MiB full request size, reported by a compatible transport.",
+          "The size trigger does not block requests or guarantee prevention of oversized-message failures.",
           "Default: 1 automatic retry after the initial attempt, within the original preparation deadline.",
           "Only producer-confirmed transient failures retry; cancellation, stale state and unclassified failures do not.",
           "Use /background-compaction resume to clear a session-only failure pause.",
@@ -193,6 +205,8 @@ export function createBackgroundCompactionMenu(
       "set-auto-apply": ({ ctx, value, signal }) => save(ctx, { asyncAutoApply: value === "On" }, signal),
       "set-threshold": ({ ctx, value, signal }) =>
         save(ctx, { asyncThresholdPercent: Number.parseInt(value ?? "65", 10) }, signal),
+      "set-size": ({ ctx, value, signal }) =>
+        save(ctx, { asyncRequestSizeMiB: Number.parseInt(value ?? "13", 10) }, signal),
       "set-retries": ({ ctx, value, signal }) => save(ctx, { asyncRetryCount: Number(value) }, signal),
       "set-log": ({ ctx, value, signal }) => save(ctx, { logCompaction: value === "On" }, signal),
     },

@@ -27,7 +27,11 @@ Removing this companion does not remove the engine's manual compaction or checkp
 
 After installation, background preparation, **Apply when ready**, and progress notices are enabled by default. Run `/background-compaction` and open **Settings** to change them.
 
-After a completed turn, preparation can start when context usage reaches the configured threshold, which defaults to 70%. You can keep working while it runs.
+After a completed turn, preparation can start when either context usage reaches the configured token threshold (default 70%) **or a compatible transport reports a full request of at least 13 MiB**. You can keep working while it runs.
+
+The full-request threshold is configurable in `/background-compaction` → Settings → **Full-request size threshold** (`asyncRequestSizeMiB`, integer 1–32). One MiB is 1,048,576 bytes. Update `pi-chatgpt-zstd` to the version providing `pi.request-context-size.v1:observed`; older/absent transports leave the token trigger working normally. The transport measures the complete serialized full WebSocket request, including images and tool output, even if it sends only a small delta. Lifecycle logs identify a size-triggered preparation.
+
+This is a proactive trigger, not a server limit or pre-send blocker. It runs at the existing successful completed-turn boundary, so a single large batch can still exceed the server limit before compaction. It does not add 1009 recovery, remove images, switch transport, or change existing request-size limits. Observations are single-turn and expire on compaction, navigation, model/session changes, cancellation, or failure.
 
 There are two ways to use a prepared checkpoint:
 
@@ -95,6 +99,7 @@ Settings are stored in `pi-background-compaction.json` inside Pi's agent directo
 | `asyncEnabled` | `true` | Allow background checkpoint preparation. |
 | `asyncAutoApply` | `true` | Apply ready checkpoints without waiting for ordinary compaction. Requires background preparation to be enabled. |
 | `asyncThresholdPercent` | `70` | Context usage percentage that allows preparation. Must be an integer from 1 to 99. |
+| `asyncRequestSizeMiB` | `13` | Full-request UTF-8 size that allows preparation when reported by a compatible transport. Integer 1–32 MiB; either this or the token threshold can trigger. |
 | `asyncRetryCount` | `1` | Automatic retries after the initial preparation attempt (2 attempts total by default). Integer 0–5; 0 disables retries. |
 | `logCompaction` | `true` | Show preparation and application notices. |
 

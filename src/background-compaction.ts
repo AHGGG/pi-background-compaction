@@ -12,6 +12,11 @@ import {
   type PreparedSourceResult,
 } from "./prepared-compaction-protocol.js";
 import {
+  isRequestContextSizeObservation,
+  REQUEST_CONTEXT_SIZE_OBSERVED,
+  type RequestContextSizeObservation,
+} from "./request-context-size-protocol.js";
+import {
   type BackgroundCompactionSettingsRuntime,
   compactionSettingsKey,
   createBackgroundCompactionSettingsRuntime,
@@ -51,6 +56,7 @@ export function createBackgroundCompactionExtension(
     const runtime = options.settingsRuntime ?? createBackgroundCompactionSettingsRuntime();
     const owners = new WeakMap<object, Owner>();
     const activeManagers = new Set<object>();
+    const requestSizes = new WeakMap<object, RequestContextSizeObservation>();
     const attempted = new WeakSet<BackgroundJob>();
     // A model failure is not an application attempt. Wait for a successful
     // turn before re-enabling automatic application, including at idle input.
@@ -76,6 +82,37 @@ export function createBackgroundCompactionExtension(
       owners.get(ctx.sessionManager) === owner &&
       !owner.controller.signal.aborted &&
       owner.sessionId === ctx.sessionManager.getSessionId();
+    const currentRequestSize = (ctx: ExtensionContext, observation?: RequestContextSizeObservation) => {
+      if (
+        !observation ||
+        observation.sessionManager !== ctx.sessionManager ||
+        observation.sessionId !== ctx.sessionManager.getSessionId() ||
+        observation.provider !== ctx.model?.provider ||
+        observation.model !== ctx.model?.id
+      )
+        return undefined;
+      try {
+        return observation.isCurrent() ? observation.fullRequestBytes : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    // Observations only authorize the existing completed-turn preparation path.
+    // They are consumed once, never used to block, reroute, or retry inference.
+    const observeRequestSize = (value: unknown) => {
+      if (!isRequestContextSizeObservation(value)) return;
+      const owner = owners.get(value.sessionManager);
+      if (!owner || owner.controller.signal.aborted || owner.sessionId !== value.sessionId) return;
+      try {
+        if (value.isCurrent()) requestSizes.set(value.sessionManager, value);
+      } catch {
+        /* Optional producer diagnostics cannot fail the foreground request. */
+      }
+    };
+    let unsubscribeRequestSize: (() => void) | undefined = pi.events.on(
+      REQUEST_CONTEXT_SIZE_OBSERVED,
+      observeRequestSize,
+    );
     const log = (ctx: ExtensionContext, message: string) => {
       const owner = owners.get(ctx.sessionManager);
       if (ctx.hasUI && runtime.get().settings.logCompaction && owner && owned(ctx, owner))
@@ -477,6 +514,8 @@ export function createBackgroundCompactionExtension(
       },
     });
     pi.on("session_start", async (_event, ctx) => {
+      requestSizes.delete(ctx.sessionManager);
+      unsubscribeRequestSize ??= pi.events.on(REQUEST_CONTEXT_SIZE_OBSERVED, observeRequestSize);
       const previous = owners.get(ctx.sessionManager);
       previous?.controller.abort();
       previous?.autoApply?.release();
@@ -518,6 +557,8 @@ export function createBackgroundCompactionExtension(
     });
 
     pi.on("turn_end", async (event, ctx) => {
+      const observation = requestSizes.get(ctx.sessionManager);
+      requestSizes.delete(ctx.sessionManager);
       confirmBoundary(ctx);
       const owner = ownerFor(ctx);
       if (event.outcome !== "completed" || ctx.signal?.aborted) {
@@ -608,15 +649,17 @@ export function createBackgroundCompactionExtension(
       )
         return;
       const usage = ctx.getContextUsage();
-      if (
-        !usage ||
-        usage.tokens === null ||
-        !Number.isFinite(usage.tokens) ||
-        !Number.isFinite(usage.contextWindow) ||
-        usage.contextWindow <= 0 ||
-        (usage.tokens / usage.contextWindow) * 100 < settings.asyncThresholdPercent
-      )
-        return;
+      const tokenPressure =
+        !!usage &&
+        usage.tokens !== null &&
+        Number.isFinite(usage.tokens) &&
+        Number.isFinite(usage.contextWindow) &&
+        usage.contextWindow > 0 &&
+        (usage.tokens / usage.contextWindow) * 100 >= settings.asyncThresholdPercent;
+      const fullRequestBytes = currentRequestSize(ctx, observation);
+      const bytePressure =
+        fullRequestBytes !== undefined && fullRequestBytes >= settings.asyncRequestSizeMiB * 1024 * 1024;
+      if (!tokenPressure && !bytePressure) return;
       const preparation = engine.capture(ctx);
       if (!preparation) return;
       const started = startBackgroundJob(preparation, ctx, runtime, owner.controller.signal, () => owned(ctx, owner), {
@@ -637,7 +680,12 @@ export function createBackgroundCompactionExtension(
       owner.job = started;
       ctx.ui.setStatus(STATUS_KEY, "Preparing compaction…");
       if (ctx.hasUI && supportsPreparationDiagnostics(preparation)) watchPreparation(ctx, owner, started);
-      log(ctx, "Async compaction triggered: preparing a compaction result in the background.");
+      log(
+        ctx,
+        bytePressure
+          ? `Async compaction triggered: full request ${((fullRequestBytes ?? 0) / (1024 * 1024)).toFixed(2)} MiB reached ${settings.asyncRequestSizeMiB} MiB; preparing a compaction result in the background.`
+          : "Async compaction triggered: preparing a compaction result in the background.",
+      );
       const settled = () => {
         if (owner.job !== started || !owned(ctx, owner)) return;
         ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -676,6 +724,7 @@ export function createBackgroundCompactionExtension(
       void started.promise.then(settled, settled);
     });
     pi.on("session_compact", (_event, ctx) => {
+      requestSizes.delete(ctx.sessionManager);
       const owner = owners.get(ctx.sessionManager);
       if (owner?.compactionPending) {
         owner.compactionPending = false;
@@ -700,13 +749,17 @@ export function createBackgroundCompactionExtension(
       if (event.aborted) stopPreparation(ctx);
       else await applyAtIdleBoundary(ctx);
     });
-    pi.on("turn_start", (_event, ctx) => confirmBoundary(ctx));
+    pi.on("turn_start", (_event, ctx) => {
+      requestSizes.delete(ctx.sessionManager);
+      confirmBoundary(ctx);
+    });
     pi.on("context", (_event, ctx) => {
       confirmBoundary(ctx);
       const job = owners.get(ctx.sessionManager)?.job;
       if (job && !job.isCurrent()) cancelJob(ctx);
     });
     const navigate = (_event: unknown, ctx: ExtensionContext) => {
+      requestSizes.delete(ctx.sessionManager);
       const owner = owners.get(ctx.sessionManager);
       owner?.operation?.abort();
       if (owner) owner.compactionPending = false;
@@ -716,6 +769,7 @@ export function createBackgroundCompactionExtension(
     pi.on("session_before_fork", navigate);
     pi.on("session_before_tree", navigate);
     pi.on("thinking_level_select", (_event, ctx) => {
+      requestSizes.delete(ctx.sessionManager);
       const job = owners.get(ctx.sessionManager)?.job;
       // The engine owns format-specific validity. Older engines retain their strict check.
       if (job && !job.isCurrent()) navigate(_event, ctx);
@@ -723,6 +777,7 @@ export function createBackgroundCompactionExtension(
     pi.on("model_select", navigate);
     pi.on("session_tree", navigate);
     pi.on("session_shutdown", async (_event, ctx) => {
+      requestSizes.delete(ctx.sessionManager);
       const owner = ownerFor(ctx);
       owner.controller.abort();
       owner.job?.controller.abort();
@@ -732,6 +787,8 @@ export function createBackgroundCompactionExtension(
       ctx.ui.setStatus(STATUS_KEY, undefined);
       activeManagers.delete(ctx.sessionManager);
       if (activeManagers.size === 0) {
+        unsubscribeRequestSize?.();
+        unsubscribeRequestSize = undefined;
         detachSource?.();
         detachSource = undefined;
         engine = undefined;

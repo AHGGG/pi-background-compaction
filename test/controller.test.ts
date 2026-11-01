@@ -10,6 +10,10 @@ import {
   type PreparedCheckpoint,
   type PreparedCompactionSource,
 } from "../src/prepared-compaction-protocol.js";
+import {
+  REQUEST_CONTEXT_SIZE_OBSERVED,
+  type RequestContextSizeObservation,
+} from "../src/request-context-size-protocol.js";
 import { type BackgroundCompactionSettingsRuntime, DEFAULT_BACKGROUND_COMPACTION_SETTINGS } from "../src/settings.js";
 
 type Hook = (event: never, ctx: ExtensionContext) => unknown;
@@ -106,6 +110,7 @@ function fixture(order: "first" | "last" | "absent" = "first") {
   const context = (id: string, signal = new AbortController().signal) =>
     ({
       sessionManager: { getSessionId: () => id },
+      model: { provider: "openai", id: "fixture-model" },
       hasUI: true,
       mode: "tui",
       signal,
@@ -1132,3 +1137,151 @@ for (const action of ["manual-cancel", "session_before_switch", "model_select", 
       vi.useRealTimers();
     }
   });
+
+function reportSize(h: ReturnType<typeof fixture>, bytes: number, patch: Partial<RequestContextSizeObservation> = {}) {
+  h.events.emit(REQUEST_CONTEXT_SIZE_OBSERVED, {
+    sessionManager: h.ctx.sessionManager,
+    sessionId: h.ctx.sessionManager.getSessionId(),
+    provider: h.ctx.model?.provider ?? "openai",
+    model: h.ctx.model?.id ?? "fixture-model",
+    fullRequestBytes: bytes,
+    isCurrent: () => true,
+    ...patch,
+  });
+}
+const MiB = 1024 * 1024;
+
+test("13 MiB full request triggers at completed turn despite low or unavailable token usage", async () => {
+  for (const missingUsage of [false, true]) {
+    const h = fixture();
+    await h.emit("session_start");
+    h.ctx.getContextUsage = () => (missingUsage ? undefined : { tokens: 10, contextWindow: 100, percent: 10 });
+    reportSize(h, 13 * MiB - 1);
+    await h.turn();
+    assert.equal(h.starts, 0);
+    reportSize(h, 13 * MiB);
+    assert.equal(h.starts, 0, "observation cannot start work before completed boundary");
+    await h.turn();
+    await drain();
+    assert.equal(h.starts, 1);
+    assert.ok(h.notices.some((text) => text.includes("13.00 MiB reached 13 MiB")));
+    await h.emit("session_shutdown");
+  }
+});
+
+test("size threshold is configurable and observations are consumed once", async () => {
+  const h = fixture();
+  await h.emit("session_start");
+  h.ctx.getContextUsage = () => undefined;
+  h.settings.asyncRequestSizeMiB = 16;
+  reportSize(h, 15 * MiB);
+  await h.turn();
+  assert.equal(h.starts, 0);
+  reportSize(h, 16 * MiB);
+  await h.turn();
+  await drain();
+  assert.equal(h.starts, 1);
+  h.commit();
+  await h.emit("session_compact");
+  await h.turn();
+  assert.equal(h.starts, 1, "compaction cannot leave old size pressure behind");
+  await h.emit("session_shutdown");
+});
+
+for (const reset of ["turn_start", "session_compact", "session_before_tree", "model_select", "session_start"]) {
+  test(`size observation cleared by ${reset}`, async () => {
+    const h = fixture();
+    await h.emit("session_start");
+    h.ctx.getContextUsage = () => undefined;
+    reportSize(h, 20 * MiB);
+    await h.emit(reset);
+    await h.turn();
+    assert.equal(h.starts, 0);
+    await h.emit("session_shutdown");
+  });
+}
+
+for (const outcome of ["error", "aborted"]) {
+  test(`${outcome} turn cannot carry size pressure into next successful turn`, async () => {
+    const h = fixture();
+    await h.emit("session_start");
+    h.ctx.getContextUsage = () => undefined;
+    reportSize(h, 20 * MiB);
+    await h.emit("turn_end", { outcome, entries: [] });
+    await h.turn();
+    assert.equal(h.starts, 0);
+    await h.emit("session_shutdown");
+  });
+}
+
+test("stale, mismatched, malformed and throwing producer observations fail closed", async () => {
+  const h = fixture();
+  await h.emit("session_start");
+  h.ctx.getContextUsage = () => undefined;
+  for (const patch of [
+    { sessionManager: {} },
+    { sessionId: "other" },
+    { provider: "other" },
+    { model: "other" },
+    { fullRequestBytes: NaN },
+    { fullRequestBytes: -1 },
+    { fullRequestBytes: 1.5 },
+    { isCurrent: () => false },
+    {
+      isCurrent: () => {
+        throw new Error("broken optional observer");
+      },
+    },
+  ]) {
+    reportSize(h, 20 * MiB, patch);
+    await h.turn();
+    assert.equal(h.starts, 0);
+  }
+  let current = true;
+  reportSize(h, 20 * MiB, { isCurrent: () => current });
+  current = false;
+  await h.turn();
+  assert.equal(h.starts, 0);
+  await h.emit("session_shutdown");
+});
+
+test("size trigger respects disabled, unavailable and existing background jobs", async () => {
+  const h = fixture();
+  await h.emit("session_start");
+  h.ctx.getContextUsage = () => undefined;
+  h.settings.asyncEnabled = false;
+  reportSize(h, 20 * MiB);
+  await h.turn();
+  assert.equal(h.starts, 0);
+  h.settings.asyncEnabled = true;
+  h.engine.available = () => false;
+  reportSize(h, 20 * MiB);
+  await h.turn();
+  assert.equal(h.starts, 0);
+  h.engine.available = () => true;
+  h.settings.asyncAutoApply = false;
+  reportSize(h, 20 * MiB);
+  await h.turn();
+  await drain();
+  assert.equal(h.starts, 1);
+  reportSize(h, 21 * MiB);
+  await h.turn();
+  assert.equal(h.starts, 1);
+  await h.emit("session_shutdown");
+});
+
+test("latest current observation replaces earlier pressure and token trigger remains independent", async () => {
+  const h = fixture();
+  await h.emit("session_start");
+  h.ctx.getContextUsage = () => undefined;
+  reportSize(h, 20 * MiB);
+  reportSize(h, 1 * MiB);
+  await h.turn();
+  assert.equal(h.starts, 0);
+  h.ctx.getContextUsage = () => ({ tokens: 70, contextWindow: 100, percent: 70 });
+  reportSize(h, 1 * MiB);
+  await h.turn();
+  await drain();
+  assert.equal(h.starts, 1);
+  await h.emit("session_shutdown");
+});

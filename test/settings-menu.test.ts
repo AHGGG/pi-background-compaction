@@ -73,11 +73,18 @@ test("main menu has Settings, Status and Help; pause and legacy source remain vi
   if (settings.kind !== "settings") assert.fail("expected settings");
   assert.deepEqual(
     settings.items.map((item) => item.currentValue),
-    ["On", "On", "70%", "1", "On"],
+    ["On", "On", "70%", "13 MiB", "1", "On"],
   );
   assert.deepEqual(
     settings.items.map((item) => item.id),
-    ["asyncEnabled", "asyncAutoApply", "asyncThresholdPercent", "asyncRetryCount", "logCompaction"],
+    [
+      "asyncEnabled",
+      "asyncAutoApply",
+      "asyncThresholdPercent",
+      "asyncRequestSizeMiB",
+      "asyncRetryCount",
+      "logCompaction",
+    ],
   );
 });
 
@@ -103,13 +110,15 @@ test("settings patches are precise and only preparation changes invalidate jobs"
   await menu.actions["set-enabled"](action("On"));
   await menu.actions["set-threshold"](action("75%"));
   await menu.actions["set-retries"](action("0"));
-  assert.equal(changes, 3);
+  await menu.actions["set-size"](action("16 MiB"));
+  assert.equal(changes, 4);
   assert.deepEqual(patches, [
     { logCompaction: true },
     { asyncAutoApply: true },
     { asyncEnabled: true },
     { asyncThresholdPercent: 75 },
     { asyncRetryCount: 0 },
+    { asyncRequestSizeMiB: 16 },
   ]);
 });
 

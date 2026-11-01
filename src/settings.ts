@@ -13,11 +13,17 @@ export interface BackgroundCompactionSettings {
   logCompaction: boolean;
   asyncThresholdPercent: number;
   asyncRetryCount: number;
+  asyncRequestSizeMiB: number;
 }
 
 /** Logging and application timing do not invalidate prepared work. */
 export function compactionSettingsKey(settings: BackgroundCompactionSettings): string {
-  return JSON.stringify([settings.asyncEnabled, settings.asyncThresholdPercent, settings.asyncRetryCount]);
+  return JSON.stringify([
+    settings.asyncEnabled,
+    settings.asyncThresholdPercent,
+    settings.asyncRetryCount,
+    settings.asyncRequestSizeMiB,
+  ]);
 }
 
 export const DEFAULT_BACKGROUND_COMPACTION_SETTINGS: Readonly<BackgroundCompactionSettings> = Object.freeze({
@@ -26,6 +32,7 @@ export const DEFAULT_BACKGROUND_COMPACTION_SETTINGS: Readonly<BackgroundCompacti
   logCompaction: true,
   asyncThresholdPercent: 70,
   asyncRetryCount: 1,
+  asyncRequestSizeMiB: 13,
 });
 
 export interface BackgroundCompactionSettingsState {
@@ -73,7 +80,19 @@ export function normalizeBackgroundCompactionSettings(value: unknown): Backgroun
       value.asyncRetryCount > 5)
   )
     return undefined;
+  if (
+    Object.hasOwn(value, "asyncRequestSizeMiB") &&
+    (typeof value.asyncRequestSizeMiB !== "number" ||
+      !Number.isSafeInteger(value.asyncRequestSizeMiB) ||
+      value.asyncRequestSizeMiB < 1 ||
+      value.asyncRequestSizeMiB > 32)
+  )
+    return undefined;
   return {
+    asyncRequestSizeMiB:
+      typeof value.asyncRequestSizeMiB === "number"
+        ? value.asyncRequestSizeMiB
+        : DEFAULT_BACKGROUND_COMPACTION_SETTINGS.asyncRequestSizeMiB,
     asyncRetryCount:
       typeof value.asyncRetryCount === "number"
         ? value.asyncRetryCount
