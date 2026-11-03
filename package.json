@@ -1,6 +1,6 @@
 {
   "name": "pi-background-compaction",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Optional safe-boundary background preparation for Pi compaction engines.",
   "type": "module",
   "license": "MIT",
