@@ -8,7 +8,15 @@ import type {
 import { terminalText as safeText } from "./terminal.js";
 
 type Screen = "main" | "settings" | "status" | "help" | "invalid";
-type Action = "resume" | "set-enabled" | "set-auto-apply" | "set-threshold" | "set-size" | "set-retries" | "set-log";
+type Action =
+  | "prepare"
+  | "resume"
+  | "set-enabled"
+  | "set-auto-apply"
+  | "set-threshold"
+  | "set-size"
+  | "set-retries"
+  | "set-log";
 
 export interface SettingsMenuOwner {
   signal: AbortSignal;
@@ -18,6 +26,7 @@ export interface SettingsMenuOwner {
   lastPreparationStatus?(): string | undefined;
   preparationStatus?(): string | undefined;
   diagnosticReport?(): string | undefined;
+  onPrepareNow?(): void;
   onResumeWarm?(): void;
   onSettingsChanged?(): void;
 }
@@ -29,6 +38,7 @@ type MenuOptions = Pick<
   | "lastPreparationStatus"
   | "preparationStatus"
   | "diagnosticReport"
+  | "onPrepareNow"
   | "onResumeWarm"
   | "onSettingsChanged"
 >;
@@ -85,6 +95,7 @@ export function createBackgroundCompactionMenu(
         title: "Background Compaction",
         lines: status(state),
         items: [
+          { id: "prepare", label: "Prepare now", action: "prepare" as const },
           ...(options.warmPauseReason?.()
             ? [{ id: "resume", label: "Resume background preparation", action: "resume" as const }]
             : []),
@@ -178,6 +189,8 @@ export function createBackgroundCompactionMenu(
           "The size trigger does not block requests or guarantee prevention of oversized-message failures.",
           "Default: 1 automatic retry after the initial attempt, within the original preparation deadline.",
           "Only producer-confirmed transient failures retry; cancellation, stale state and unclassified failures do not.",
+          "Use /background-compaction prepare (or Prepare now) while idle to bypass thresholds; background preparation must be On.",
+          "Prepare now reuses a current job, clears a failure pause only when starting, and keeps Apply when ready unchanged.",
           "Use /background-compaction resume to clear a session-only failure pause.",
           "Failures print a complete report when the engine supports diagnostics; /background-compaction diagnostics shows retained reports.",
           "Preparation progress and inactivity advisories do not change the request deadline.",
@@ -197,6 +210,10 @@ export function createBackgroundCompactionMenu(
       }),
     },
     actions: {
+      prepare: () => {
+        options.onPrepareNow?.();
+        return { kind: "stay" };
+      },
       resume: () => {
         options.onResumeWarm?.();
         return { kind: "stay" };
@@ -232,6 +249,9 @@ export async function showBackgroundCompactionMenu(
       lastPreparationStatus: owner.lastPreparationStatus,
       preparationStatus: owner.preparationStatus,
       diagnosticReport: owner.diagnosticReport,
+      onPrepareNow: () => {
+        if (!owner.signal.aborted && owner.isCurrent()) owner.onPrepareNow?.();
+      },
       onResumeWarm: () => {
         if (!owner.signal.aborted && owner.isCurrent()) owner.onResumeWarm?.();
       },

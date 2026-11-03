@@ -64,7 +64,7 @@ test("main menu has Settings, Status and Help; pause and legacy source remain vi
   if (main.kind !== "actions") assert.fail("expected actions");
   assert.deepEqual(
     main.items.map((item) => item.label),
-    ["Resume background preparation", "Settings", "Status", "Help", "Close"],
+    ["Prepare now", "Resume background preparation", "Settings", "Status", "Help", "Close"],
   );
   assert.match(main.lines?.join("\n") ?? "", /provider changed/);
   assert.match(main.lines?.join("\n") ?? "", /Using legacy preferences/);
@@ -194,6 +194,7 @@ test("TUI framing remains bounded and focused settings survive resize", async ()
     try {
       if (screens === 1) {
         main = harness.render();
+        harness.handleInput("tui.select.down");
         harness.handleInput("tui.select.confirm");
       } else if (screens === 2) {
         normal = harness.render();
@@ -308,4 +309,22 @@ test("status distinguishes an empty current slot from the retained cancellation 
     status.lines?.join("\n") ?? "",
     /Prepared compaction: none\nLast preparation: Discarded — captured prefix changed/,
   );
+});
+
+test("Prepare now invokes its callback without writing settings", async () => {
+  const { runtime, patches } = memoryRuntime();
+  let prepared = 0;
+  const menu = createBackgroundCompactionMenu(runtime, {
+    onPrepareNow: () => {
+      prepared++;
+    },
+  });
+  await menu.actions.prepare({
+    ctx: context().ctx,
+    state: runtime.get(),
+    signal: new AbortController().signal,
+    itemId: "prepare",
+  });
+  assert.equal(prepared, 1);
+  assert.deepEqual(patches, []);
 });

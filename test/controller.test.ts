@@ -138,6 +138,7 @@ function fixture(order: "first" | "last" | "absent" = "first") {
   const turn = (target = ctx) => emit("turn_end", { outcome: "completed", entries: [] }, target);
   return {
     engine,
+    runtime,
     events,
     context,
     ctx,
@@ -1283,5 +1284,151 @@ test("latest current observation replaces earlier pressure and token trigger rem
   await h.turn();
   await drain();
   assert.equal(h.starts, 1);
+  await h.emit("session_shutdown");
+});
+
+const prepareCommand = (h: ReturnType<typeof fixture>) =>
+  (h.commands.get("background-compaction") as { handler(args: string, ctx: unknown): Promise<void> }).handler(
+    "prepare",
+    h.ctx,
+  );
+
+test("manual preparation bypasses thresholds, returns while pending, and reuses Preparing and Ready", async () => {
+  const h = fixture();
+  h.ctx.isIdle = () => true;
+  h.ctx.getContextUsage = () => undefined;
+  h.settings.asyncAutoApply = false;
+  let finish!: (value: PreparedCheckpoint) => void;
+  let calls = 0;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 500,
+    isCurrent: () => true,
+    start: () => {
+      calls++;
+      return new Promise<PreparedCheckpoint>((resolve) => {
+        finish = resolve;
+      });
+    },
+  });
+  await h.emit("session_start");
+  await prepareCommand(h);
+  assert.equal(calls, 1);
+  await prepareCommand(h);
+  assert.equal(calls, 1);
+  assert.ok(h.notices.some((n) => n.includes("already preparing")));
+  finish({
+    usable: true,
+    checkpointId: "ready",
+    adopt: async () => ({ kind: "cancel" }),
+    draft: async () => undefined,
+  });
+  await drain();
+  await prepareCommand(h);
+  assert.equal(calls, 1);
+  assert.ok(h.notices.some((n) => n.includes("already ready")));
+  assert.equal(h.settings.asyncAutoApply, false);
+  await h.emit("session_shutdown");
+});
+
+for (const blocked of ["disabled", "invalid", "busy", "queued", "engine", "capture", "aborted"] as const)
+  test(`manual preparation refuses ${blocked} without starting or changing settings`, async () => {
+    const h = fixture();
+    h.ctx.isIdle = () => true;
+    if (blocked === "disabled") h.settings.asyncEnabled = false;
+    if (blocked === "invalid") (h.runtime.get() as { kind: string }).kind = "invalid";
+    if (blocked === "busy") h.ctx.isIdle = () => false;
+    if (blocked === "queued") h.ctx.hasPendingMessages = () => true;
+    if (blocked === "engine") h.engine.available = () => false;
+    if (blocked === "capture") h.engine.capture = () => undefined;
+    if (blocked === "aborted") h.run.abort();
+    const settings = { ...h.settings };
+    await h.emit("session_start");
+    await prepareCommand(h);
+    assert.equal(h.starts, 0);
+    assert.deepEqual(h.settings, settings);
+    assert.ok(h.notices.length);
+    await h.emit("session_shutdown");
+  });
+
+test("manual preparation can retry a failure pause but unavailable capture preserves it", async () => {
+  const h = fixture();
+  h.ctx.isIdle = () => true;
+  const capture = h.engine.capture;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 500,
+    isCurrent: () => true,
+    start: async () => {
+      throw new Error("failure");
+    },
+  });
+  await h.emit("session_start");
+  await prepareCommand(h);
+  await drain();
+  assert.ok(h.notices.some((n) => n.includes("Warm-ahead paused")));
+  h.engine.capture = () => undefined;
+  await prepareCommand(h);
+  h.engine.capture = capture;
+  await h.turn();
+  assert.equal(h.starts, 0, "failed explicit capture must not clear pause");
+  h.ctx.getContextUsage = () => undefined;
+  await prepareCommand(h);
+  await drain();
+  assert.equal(h.starts, 1);
+  await h.emit("session_shutdown");
+});
+
+test("manual preparation replaces stale Ready and is cancelled on navigation", async () => {
+  const h = fixture();
+  h.ctx.isIdle = () => true;
+  let current = true;
+  const capture = h.engine.capture;
+  h.engine.capture = (ctx) => {
+    const result = capture(ctx);
+    assert.ok(result);
+    return { ...result, isCurrent: () => current };
+  };
+  await h.emit("session_start");
+  await prepareCommand(h);
+  await drain();
+  current = false;
+  h.engine.capture = capture;
+  await prepareCommand(h);
+  assert.equal(h.starts, 2);
+  await h.emit("session_before_switch");
+  assert.equal(h.statuses.at(-1), undefined);
+  await h.emit("session_shutdown");
+});
+
+test("manual preparation does not start if capture changes session ownership", async () => {
+  const h = fixture();
+  h.ctx.isIdle = () => true;
+  const capture = h.engine.capture;
+  h.engine.capture = (ctx) => {
+    const prepared = capture(ctx);
+    h.ctx.sessionManager.getSessionId = () => "other-session";
+    return prepared;
+  };
+  await h.emit("session_start");
+  await prepareCommand(h);
+  assert.equal(h.starts, 0);
+  await h.emit("session_shutdown");
+});
+
+test("manual preparation honors Apply when ready at the next idle input boundary", async () => {
+  const h = fixture();
+  h.ctx.isIdle = () => true;
+  h.ctx.getContextUsage = () => undefined;
+  let applications = 0;
+  h.ctx.compact = (options) => {
+    applications++;
+    options?.onComplete?.();
+  };
+  await h.emit("session_start");
+  await prepareCommand(h);
+  await drain();
+  assert.equal(applications, 0, "preparing does not force foreground compaction");
+  await h.emit("input");
+  await h.emit("input");
+  assert.equal(applications, 1);
   await h.emit("session_shutdown");
 });

@@ -4,6 +4,7 @@ import { type BackgroundJob, type PreparationRecord, startBackgroundJob } from "
 import { CompactionTimings } from "./compaction-timing.js";
 import { supportsPreparationDiagnostics } from "./preparation-diagnostics.js";
 import {
+  type CheckpointPreparation,
   COMPACTION_ENGINE_AVAILABLE,
   COMPACTION_ENGINE_REQUEST,
   type CompactionEngineV1,
@@ -466,17 +467,145 @@ export function createBackgroundCompactionExtension(
       await done;
     };
 
+    const beginPreparation = (
+      ctx: ExtensionContext,
+      owner: Owner,
+      preparation: CheckpointPreparation,
+      notice: string,
+    ) => {
+      const settings = runtime.get().settings;
+      const started = startBackgroundJob(preparation, ctx, runtime, owner.controller.signal, () => owned(ctx, owner), {
+        onRetry: (count, delayMs) => {
+          if (!owned(ctx, owner)) return;
+          ctx.ui.setStatus(STATUS_KEY, `Compaction retry ${count}/${settings.asyncRetryCount} in ${delayMs / 1000}s…`);
+          log(
+            ctx,
+            `Async compaction retry ${count}/${settings.asyncRetryCount} scheduled in ${delayMs / 1000}s after a transient failure. Retries may consume additional quota.`,
+          );
+        },
+        onAttempt: (count) => {
+          if (!owned(ctx, owner)) return;
+          ctx.ui.setStatus(STATUS_KEY, `Preparing compaction (retry ${count}/${settings.asyncRetryCount})…`);
+          log(ctx, `Async compaction retry ${count}/${settings.asyncRetryCount} started.`);
+        },
+      });
+      owner.job = started;
+      ctx.ui.setStatus(STATUS_KEY, "Preparing compaction…");
+      if (ctx.hasUI && supportsPreparationDiagnostics(preparation)) watchPreparation(ctx, owner, started);
+      log(ctx, notice);
+      const settled = () => {
+        if (owner.job !== started || !owned(ctx, owner)) return;
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        if (owner.job !== started || !owned(ctx, owner)) return;
+        if (!started.isCurrent() || started.state === "Discarded" || started.state === "Cancelled") {
+          if (started.state === "Failed") {
+            started.state = started.controller.signal.aborted ? "Cancelled" : "Discarded";
+            started.applicationFailure = undefined;
+          }
+          cancelJob(ctx);
+          return;
+        }
+        if (started.state === "Ready") {
+          if (ctx.hasUI)
+            ctx.ui.notify(
+              `[background-compaction] ${
+                runtime.get().settings.asyncAutoApply
+                  ? awaitingCompletedTurn.has(started)
+                    ? "Async compaction ready: waiting for a successful completed turn before automatic application."
+                    : "Async compaction ready: the prepared compaction will apply after the current model/tool batch, or at the next idle input boundary."
+                  : "Async compaction ready: run /compact to apply the prepared compaction. History is unchanged until compaction."
+              }`,
+              "info",
+            );
+        } else {
+          owner.lastPreparation = started.retain();
+          owner.lastFailedPreparation = owner.lastPreparation;
+          if (started.applicationFailure) pause(ctx, owner, preparationFailure(started), owner.generation, started);
+          else
+            log(
+              ctx,
+              `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.\n${preparationReport(started)}`,
+            );
+        }
+      };
+      void started.promise.then(settled, settled);
+    };
+    const prepareNow = (ctx: ExtensionContext, owner: Owner) => {
+      if (!owned(ctx, owner)) return;
+      const notify = (message: string) => {
+        if (ctx.hasUI) ctx.ui.notify(message, "info");
+      };
+      if (runtime.get().kind === "invalid") {
+        notify("Background compaction settings are invalid. Repair the file and reload before preparing.");
+        return;
+      }
+      if (!runtime.get().settings.asyncEnabled) {
+        notify("Background preparation is Off. Enable it in /background-compaction Settings, then choose Prepare now.");
+        return;
+      }
+      if (!engine?.available(ctx)) {
+        notify(
+          connectionIssue ?? "No available compatible compaction engine. Check the engine settings and try again.",
+        );
+        return;
+      }
+      if (
+        !ctx.isIdle() ||
+        ctx.hasPendingMessages() ||
+        ctx.signal?.aborted ||
+        owner.operation ||
+        owner.compactionPending ||
+        owner.autoApply
+      ) {
+        notify("Wait until the current model/tool run or compaction finishes, then choose Prepare now.");
+        return;
+      }
+      const previous = owner.job;
+      if (previous && (previous.state === "Preparing" || previous.state === "Ready") && previous.isCurrent()) {
+        notify(
+          previous.state === "Preparing"
+            ? "Background compaction is already preparing; no new request started."
+            : "A prepared compaction is already ready. Run /compact to apply it, or wait for automatic application.",
+        );
+        return;
+      }
+      const generation = owner.generation;
+      const preparation = engine.capture(ctx);
+      if (!preparation) {
+        notify("No background preparation is available for the current history. History is unchanged.");
+        return;
+      }
+      if (!owned(ctx, owner) || owner.generation !== generation || owner.job !== previous || !preparation.isCurrent())
+        return;
+      cancelJob(ctx, "background preparation explicitly requested");
+      if (!owned(ctx, owner) || owner.generation !== generation || owner.job) return;
+      owner.generation += 1;
+      owner.pauseReason = undefined;
+      requestSizes.delete(ctx.sessionManager);
+      beginPreparation(
+        ctx,
+        owner,
+        preparation,
+        "Async compaction triggered manually: preparing in the background without waiting for a threshold.",
+      );
+    };
+
     pi.registerCommand("background-compaction", {
-      description: "Configure background compaction, show diagnostics, or resume a paused session",
+      description: "Prepare background compaction now, configure settings, or show diagnostics",
       getArgumentCompletions: (prefix) =>
         [
+          { value: "prepare", label: "prepare — start background preparation now" },
           { value: "resume", label: "resume — retry background preparation" },
           { value: "diagnostics", label: "diagnostics — show current and last failed preparation reports" },
         ].filter(({ value }) => value.startsWith(prefix)),
       handler: async (args, ctx) => {
-        if (args.trim() && !["resume", "diagnostics"].includes(args.trim()))
-          throw new Error("Usage: /background-compaction [resume|diagnostics]");
+        if (args.trim() && !["prepare", "resume", "diagnostics"].includes(args.trim()))
+          throw new Error("Usage: /background-compaction [prepare|resume|diagnostics]");
         const owner = ownerFor(ctx);
+        if (args.trim() === "prepare") {
+          prepareNow(ctx, owner);
+          return;
+        }
         if (args.trim() === "resume") {
           resume(ctx, owner);
           return;
@@ -505,6 +634,7 @@ export function createBackgroundCompactionExtension(
           warmPauseReason: () =>
             owner.pauseReason ??
             (!engine ? (connectionIssue ?? "No compatible compaction engine installed.") : undefined),
+          onPrepareNow: () => prepareNow(ctx, owner),
           onResumeWarm: () => resume(ctx, owner),
           onSettingsChanged: () => {
             owner.operation?.abort();
@@ -662,66 +792,14 @@ export function createBackgroundCompactionExtension(
       if (!tokenPressure && !bytePressure) return;
       const preparation = engine.capture(ctx);
       if (!preparation) return;
-      const started = startBackgroundJob(preparation, ctx, runtime, owner.controller.signal, () => owned(ctx, owner), {
-        onRetry: (count, delayMs) => {
-          if (!owned(ctx, owner)) return;
-          ctx.ui.setStatus(STATUS_KEY, `Compaction retry ${count}/${settings.asyncRetryCount} in ${delayMs / 1000}s…`);
-          log(
-            ctx,
-            `Async compaction retry ${count}/${settings.asyncRetryCount} scheduled in ${delayMs / 1000}s after a transient failure. Retries may consume additional quota.`,
-          );
-        },
-        onAttempt: (count) => {
-          if (!owned(ctx, owner)) return;
-          ctx.ui.setStatus(STATUS_KEY, `Preparing compaction (retry ${count}/${settings.asyncRetryCount})…`);
-          log(ctx, `Async compaction retry ${count}/${settings.asyncRetryCount} started.`);
-        },
-      });
-      owner.job = started;
-      ctx.ui.setStatus(STATUS_KEY, "Preparing compaction…");
-      if (ctx.hasUI && supportsPreparationDiagnostics(preparation)) watchPreparation(ctx, owner, started);
-      log(
+      beginPreparation(
         ctx,
+        owner,
+        preparation,
         bytePressure
           ? `Async compaction triggered: full request ${((fullRequestBytes ?? 0) / (1024 * 1024)).toFixed(2)} MiB reached ${settings.asyncRequestSizeMiB} MiB; preparing a compaction result in the background.`
           : "Async compaction triggered: preparing a compaction result in the background.",
       );
-      const settled = () => {
-        if (owner.job !== started || !owned(ctx, owner)) return;
-        ctx.ui.setStatus(STATUS_KEY, undefined);
-        if (owner.job !== started || !owned(ctx, owner)) return;
-        if (!started.isCurrent() || started.state === "Discarded" || started.state === "Cancelled") {
-          if (started.state === "Failed") {
-            started.state = started.controller.signal.aborted ? "Cancelled" : "Discarded";
-            started.applicationFailure = undefined;
-          }
-          cancelJob(ctx);
-          return;
-        }
-        if (started.state === "Ready") {
-          if (ctx.hasUI)
-            ctx.ui.notify(
-              `[background-compaction] ${
-                runtime.get().settings.asyncAutoApply
-                  ? awaitingCompletedTurn.has(started)
-                    ? "Async compaction ready: waiting for a successful completed turn before automatic application."
-                    : "Async compaction ready: the prepared compaction will apply after the current model/tool batch, or at the next idle input boundary."
-                  : "Async compaction ready: run /compact to apply the prepared compaction. History is unchanged until compaction."
-              }`,
-              "info",
-            );
-        } else {
-          owner.lastPreparation = started.retain();
-          owner.lastFailedPreparation = owner.lastPreparation;
-          if (started.applicationFailure) pause(ctx, owner, preparationFailure(started), owner.generation, started);
-          else
-            log(
-              ctx,
-              `Async compaction failed: ${preparationFailure(started)}. Actual compaction will use the foreground recovery path.\n${preparationReport(started)}`,
-            );
-        }
-      };
-      void started.promise.then(settled, settled);
     });
     pi.on("session_compact", (_event, ctx) => {
       requestSizes.delete(ctx.sessionManager);

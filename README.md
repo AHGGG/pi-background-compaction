@@ -33,6 +33,14 @@ The full-request threshold is configurable in `/background-compaction` → Setti
 
 This is a proactive trigger, not a server limit or pre-send blocker. It runs at the existing successful completed-turn boundary, so a single large batch can still exceed the server limit before compaction. It does not add 1009 recovery, remove images, switch transport, or change existing request-size limits. Observations are single-turn and expire on compaction, navigation, model/session changes, cancellation, or failure.
 
+### Prepare manually
+
+While Pi is idle, run `/background-compaction prepare` or open `/background-compaction` → **Prepare now**. This starts background preparation immediately without waiting for either threshold and returns without waiting for the provider. You can continue working while it prepares.
+
+Background preparation must be **On**; the action does not change your saved settings. An existing current **Preparing** or **Ready** result is reused, rather than starting a duplicate request. A session failure pause is cleared only when a new preparation can actually start. If a model/tool run, queued input, or compaction is active, wait for it to finish and try again.
+
+The existing retry limit and **Apply when ready** setting still apply. Finishing preparation while idle does not itself force application: automatic application uses the next normal safe boundary, or run `/compact` to apply the result. Unlike `/compact`, `prepare` does not block until compaction completes or immediately change session history. Preparation may consume provider quota.
+
 There are two ways to use a prepared checkpoint:
 
 - **Turn Apply when ready off:** the checkpoint waits for manual `/compact` or Pi's automatic compaction.

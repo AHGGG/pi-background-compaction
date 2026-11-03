@@ -23,6 +23,14 @@
 
 移除本扩展不会移除引擎的手动压缩或检查点重放功能。
 
+## 手动启动后台准备
+
+Pi 空闲时，运行 `/background-compaction prepare`，或打开 `/background-compaction` → **Prepare now**。它会跳过 token 和请求大小阈值，立即启动后台准备并返回；无需等待模型完成，可继续工作。
+
+**Background preparation** 必须为 On，操作不会更改已保存的设置。已有有效的 Preparing 或 Ready 结果时直接复用，不重复请求。只有新准备确实可以启动时，才清除本会话的失败暂停。模型/工具运行、排队输入或压缩尚未结束时，请等结束后重试。
+
+沿用现有重试次数和 **Apply when ready** 设置。空闲时准备完成本身不会强制应用；结果会在下一个正常安全边界自动应用，也可运行 `/compact` 应用。与 `/compact` 不同，`prepare` 不等待压缩完成，也不会立即修改会话历史。准备可能消耗提供商额度。
+
 ## 开始使用
 
 安装后，后台准备、**Apply when ready（准备好后应用）**和进度提示默认开启。运行 `/background-compaction`，打开 **Settings（设置）**即可修改。
