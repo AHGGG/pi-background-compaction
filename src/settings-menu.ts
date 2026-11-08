@@ -21,7 +21,7 @@ type Action =
 export interface SettingsMenuOwner {
   signal: AbortSignal;
   isCurrent(): boolean;
-  backgroundStatus?(): "Preparing" | "Ready" | undefined;
+  backgroundStatus?(): "Queued" | "Preparing" | "Ready" | undefined;
   warmPauseReason?(): string | undefined;
   lastPreparationStatus?(): string | undefined;
   preparationStatus?(): string | undefined;
@@ -189,8 +189,10 @@ export function createBackgroundCompactionMenu(
           "The size trigger does not block requests or guarantee prevention of oversized-message failures.",
           "Default: 1 automatic retry after the initial attempt, within the original preparation deadline.",
           "Only producer-confirmed transient failures retry; cancellation, stale state and unclassified failures do not.",
-          "Use /background-compaction prepare (or Prepare now) while idle to bypass thresholds; background preparation must be On.",
-          "Prepare now reuses a current job, clears a failure pause only when starting, and keeps Apply when ready unchanged.",
+          "Use /background-compaction prepare (or Prepare now) to bypass thresholds; background preparation must be On.",
+          "While busy, Prepare now queues once for the next successful model/tool batch without blocking the agent.",
+          "Prepare now reuses current work, clears a failure pause only when starting, and keeps Apply when ready unchanged.",
+          "Queued requests are cleared by cancellation, compaction, navigation, model or preparation settings changes.",
           "Use /background-compaction resume to clear a session-only failure pause.",
           "Failures print a complete report when the engine supports diagnostics; /background-compaction diagnostics shows retained reports.",
           "Preparation progress and inactivity advisories do not change the request deadline.",

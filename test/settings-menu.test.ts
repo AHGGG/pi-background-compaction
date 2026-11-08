@@ -328,3 +328,11 @@ test("Prepare now invokes its callback without writing settings", async () => {
   assert.equal(prepared, 1);
   assert.deepEqual(patches, []);
 });
+
+test("menu status distinguishes queued intent from a prepared checkpoint", () => {
+  const { runtime } = memoryRuntime();
+  const menu = createBackgroundCompactionMenu(runtime, { backgroundStatus: () => "Queued" });
+  for (const screen of ["main", "status"] as const) {
+    assert.match(resolveMenuScreen(menu, screen, runtime.get()).lines?.join("\n") ?? "", /Prepared compaction: Queued/);
+  }
+});

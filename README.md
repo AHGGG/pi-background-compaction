@@ -35,9 +35,9 @@ This is a proactive trigger, not a server limit or pre-send blocker. It runs at 
 
 ### Prepare manually
 
-While Pi is idle, run `/background-compaction prepare` or open `/background-compaction` → **Prepare now**. This starts background preparation immediately without waiting for either threshold and returns without waiting for the provider. You can continue working while it prepares.
+Run `/background-compaction prepare` or open `/background-compaction` → **Prepare now**. When Pi is idle, preparation starts immediately. While a model/tool run or queued input is active, it queues one request for the next successful completed model/tool batch (`turn_end`), then captures the completed history and starts in the background. Both paths bypass the thresholds and return without waiting for the provider; the agent can keep working.
 
-Background preparation must be **On**; the action does not change your saved settings. An existing current **Preparing** or **Ready** result is reused, rather than starting a duplicate request. A session failure pause is cleared only when a new preparation can actually start. If a model/tool run, queued input, or compaction is active, wait for it to finish and try again.
+Background preparation must be **On**; the action does not change your saved settings. An existing current **Preparing** or **Ready** result is reused, rather than starting a duplicate request. A session failure pause is cleared only when a new preparation can actually start. Repeated requests do not add more queued work. A queued request survives a model error until a successful batch, but cancellation, navigation, compaction, model/thinking-level changes, and preparation-affecting settings changes clear it. If the engine cannot capture at that boundary, the request is consumed without starting; choose Prepare again to retry. Active compaction still requires waiting until it finishes.
 
 The existing retry limit and **Apply when ready** setting still apply. Finishing preparation while idle does not itself force application: automatic application uses the next normal safe boundary, or run `/compact` to apply the result. Unlike `/compact`, `prepare` does not block until compaction completes or immediately change session history. Preparation may consume provider quota.
 

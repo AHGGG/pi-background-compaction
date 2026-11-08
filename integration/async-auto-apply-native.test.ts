@@ -73,7 +73,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] as const) {
+for (const boundary of ["settled", "input", "queued", "retry", "manual", "manual-cancel"] as const) {
   test(`real Pi auto-apply at ${boundary}: commits once without extra inference or active abort`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "pi-auto-apply-native-"));
     const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -81,6 +81,8 @@ for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] 
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
     const releaseMaintenance = deferred();
     const maintenanceStarted = deferred();
+    const firstWorkStarted = deferred();
+    const releaseFirstWork = deferred();
     let remoteCalls = 0;
     let workCalls = 0;
     let compactEvents = 0;
@@ -117,6 +119,24 @@ for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] 
                 // Let the prepared result settle while this model request is active.
                 for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
                 throw new Error("ChatGPT WebSocket closed (closed_before_completion); no HTTP replay performed");
+              }
+              if (boundary === "queued" && workCalls === 1) {
+                const response = await textResponse("Work completed").text();
+                const events = response.split("\n\n");
+                const encoder = new TextEncoder();
+                return new Response(
+                  new ReadableStream<Uint8Array>({
+                    async start(controller) {
+                      // Deliver a real text delta, then hold the active model stream open.
+                      controller.enqueue(encoder.encode(`${events.slice(0, 2).join("\n\n")}\n\n`));
+                      firstWorkStarted.resolve();
+                      await releaseFirstWork.promise;
+                      controller.enqueue(encoder.encode(events.slice(2).join("\n\n")));
+                      controller.close();
+                    },
+                  }),
+                  { headers: { "content-type": "text/event-stream" } },
+                );
               }
               return textResponse("Work completed", workCalls === 1 ? 70_000 : 10);
             },
@@ -240,8 +260,29 @@ for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] 
           order.push("compacted");
         }
       });
-      await session.prompt("First task");
-      if (boundary === "input") {
+      if (boundary === "queued") {
+        let firstFinished = false;
+        const first = session.prompt("First task").finally(() => {
+          firstFinished = true;
+        });
+        void first.catch(() => undefined);
+        await firstWorkStarted.promise;
+        for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
+        assert.equal(session.isStreaming, true);
+        assert.equal(firstFinished, false);
+        await session.prompt("/background-compaction prepare");
+        await session.prompt("/background-compaction prepare");
+        assert.equal(remoteCalls, 0, "busy commands must queue one intent without capturing or starting inference");
+        assert.equal(workCalls, 1, "extension commands must not start another foreground request");
+        assert.ok(workSignals.every((signal) => !signal.aborted));
+        releaseFirstWork.resolve();
+        await first;
+        await maintenanceStarted.promise;
+        assert.equal(remoteCalls, 1, "the completed batch consumes the below-threshold manual request once");
+        assert.equal(firstFinished, true, "the prompt returns while background provider work is still pending");
+        assert.equal(latestCheckpoint(manager.getBranch()), undefined);
+      } else await session.prompt("First task");
+      if (boundary === "input" || boundary === "queued") {
         assert.equal(compactEvents, 0);
         await maintenanceStarted.promise;
         releaseMaintenance.resolve();
@@ -298,6 +339,7 @@ for (const boundary of ["settled", "input", "retry", "manual", "manual-cancel"] 
       assert.equal(session.isIdle, true);
       assert.ok(workSignals.every((signal) => !signal.aborted));
     } finally {
+      releaseFirstWork.resolve();
       releaseMaintenance.resolve();
       if (session) {
         await session.abort();

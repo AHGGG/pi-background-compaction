@@ -1330,14 +1330,12 @@ test("manual preparation bypasses thresholds, returns while pending, and reuses 
   await h.emit("session_shutdown");
 });
 
-for (const blocked of ["disabled", "invalid", "busy", "queued", "engine", "capture", "aborted"] as const)
+for (const blocked of ["disabled", "invalid", "engine", "capture", "aborted"] as const)
   test(`manual preparation refuses ${blocked} without starting or changing settings`, async () => {
     const h = fixture();
     h.ctx.isIdle = () => true;
     if (blocked === "disabled") h.settings.asyncEnabled = false;
     if (blocked === "invalid") (h.runtime.get() as { kind: string }).kind = "invalid";
-    if (blocked === "busy") h.ctx.isIdle = () => false;
-    if (blocked === "queued") h.ctx.hasPendingMessages = () => true;
     if (blocked === "engine") h.engine.available = () => false;
     if (blocked === "capture") h.engine.capture = () => undefined;
     if (blocked === "aborted") h.run.abort();
@@ -1432,3 +1430,250 @@ test("manual preparation honors Apply when ready at the next idle input boundary
   assert.equal(applications, 1);
   await h.emit("session_shutdown");
 });
+
+for (const busy of ["running", "pending-input"] as const)
+  test(`manual preparation queues once while ${busy} and starts without blocking the completed batch`, async () => {
+    const h = fixture();
+    h.ctx.isIdle = () => busy === "pending-input";
+    h.ctx.hasPendingMessages = () => busy === "pending-input";
+    h.ctx.getContextUsage = () => undefined;
+    h.settings.asyncAutoApply = false;
+    let calls = 0;
+    let captures = 0;
+    let finish!: (value: PreparedCheckpoint) => void;
+    h.engine.capture = () => {
+      captures++;
+      return {
+        requestTimeoutMs: 500,
+        isCurrent: () => true,
+        start: () => {
+          calls++;
+          return new Promise<PreparedCheckpoint>((resolve) => {
+            finish = resolve;
+          });
+        },
+      };
+    };
+    await h.emit("session_start");
+    await prepareCommand(h);
+    await prepareCommand(h);
+    assert.equal(captures, 0, "busy command must not capture partial history");
+    assert.equal(calls, 0);
+    assert.ok(h.notices.some((notice) => notice.includes("already queued")));
+    assert.equal(h.statuses.at(-1), "Background preparation queued…");
+    await h.emit("input");
+    await h.emit("agent_settled", { aborted: false });
+    assert.equal(calls, 0, "only a successful turn_end consumes the queue");
+    await h.turn();
+    assert.equal(captures, 1);
+    assert.equal(calls, 1, "turn_end returns with provider still pending");
+    await prepareCommand(h);
+    await h.turn();
+    assert.equal(calls, 1, "Preparing does not enqueue follow-on work");
+    finish({ usable: true, adopt: async () => ({ kind: "cancel" }), draft: async () => undefined });
+    await drain();
+    await prepareCommand(h);
+    await h.turn();
+    assert.equal(calls, 1, "Ready does not enqueue follow-on work");
+    assert.equal(h.settings.asyncAutoApply, false);
+    await h.emit("session_shutdown");
+  });
+
+test("queued manual preparation survives model errors and captures only the later successful batch", async () => {
+  const h = fixture();
+  h.ctx.getContextUsage = () => undefined;
+  await h.emit("session_start");
+  await prepareCommand(h);
+  await h.emit("turn_end", { outcome: "error", entries: [] });
+  await h.emit("agent_settled", { aborted: false });
+  await h.emit("turn_start");
+  assert.equal(h.starts, 0);
+  await h.turn();
+  assert.equal(h.starts, 1);
+  await h.emit("session_shutdown");
+});
+
+for (const action of [
+  "abort-signal",
+  "aborted-turn",
+  "aborted-settlement",
+  "session_before_switch",
+  "session_before_fork",
+  "session_before_tree",
+  "session_tree",
+  "model_select",
+  "thinking_level_select",
+  "session_compact",
+  "session_start",
+  "session_shutdown",
+  "session-id",
+  "model-id",
+  "provider",
+  "settings",
+  "disabled",
+  "invalid",
+] as const)
+  test(`queued manual preparation is invalidated by ${action}`, async () => {
+    const h = fixture();
+    h.ctx.getContextUsage = () => undefined;
+    await h.emit("session_start");
+    await prepareCommand(h);
+    if (action === "abort-signal") h.run.abort();
+    else if (action === "aborted-turn") await h.emit("turn_end", { outcome: "aborted", entries: [] });
+    else if (action === "aborted-settlement") await h.emit("agent_settled", { aborted: true });
+    else if (action === "session-id") h.ctx.sessionManager.getSessionId = () => "replaced";
+    else if (action === "model-id")
+      h.ctx.model = { ...h.ctx.model, id: "other" } as NonNullable<ExtensionContext["model"]>;
+    else if (action === "provider")
+      h.ctx.model = { ...h.ctx.model, provider: "other" } as NonNullable<ExtensionContext["model"]>;
+    else if (action === "settings") h.settings.asyncThresholdPercent++;
+    else if (action === "disabled") h.settings.asyncEnabled = false;
+    else if (action === "invalid") (h.runtime.get() as { kind: string }).kind = "invalid";
+    else await h.emit(action);
+    await h.turn();
+    await h.turn();
+    assert.equal(h.starts, 0);
+    assert.equal(h.statuses.at(-1), undefined);
+    await h.emit("session_shutdown");
+  });
+
+for (const unavailable of ["engine", "capture", "compaction-entry", "context-edit"] as const)
+  test(`queued preparation is consumed once when ${unavailable} prevents starting`, async () => {
+    const h = fixture();
+    h.ctx.getContextUsage = () => undefined;
+    await h.emit("session_start");
+    await prepareCommand(h);
+    const capture = h.engine.capture;
+    if (unavailable === "engine") h.engine.available = () => false;
+    if (unavailable === "capture") h.engine.capture = () => undefined;
+    await h.emit("turn_end", {
+      outcome: "completed",
+      entries:
+        unavailable === "compaction-entry"
+          ? [{ type: "compaction" }]
+          : unavailable === "context-edit"
+            ? [{ type: "context_edit" }]
+            : [],
+    });
+    h.engine.available = () => true;
+    h.engine.capture = capture;
+    await h.turn();
+    assert.equal(h.starts, 0);
+    await h.emit("session_shutdown");
+  });
+
+test("foreground compaction cancels queued preparation even if compaction fails", async () => {
+  const h = fixture();
+  h.ctx.getContextUsage = () => undefined;
+  await h.emit("session_start");
+  await prepareCommand(h);
+  const signal = new AbortController().signal;
+  assert.deepEqual(
+    await h.source?.beforeCompact({ reason: "manual", signal } as never, h.ctx, {
+      signal,
+      isCurrent: () => true,
+    }),
+    { kind: "absent" },
+  );
+  await h.emit("session_compact_failed", { aborted: true });
+  await h.turn();
+  assert.equal(h.starts, 0);
+  await h.emit("session_shutdown");
+});
+
+test("queued request preserves failure pause until a preparation can start", async () => {
+  const h = fixture();
+  const capture = h.engine.capture;
+  h.ctx.isIdle = () => true;
+  h.engine.capture = () => ({
+    requestTimeoutMs: 500,
+    isCurrent: () => true,
+    start: async () => {
+      throw new Error("failure");
+    },
+  });
+  await h.emit("session_start");
+  await prepareCommand(h);
+  await drain();
+  h.ctx.isIdle = () => false;
+  h.engine.capture = () => undefined;
+  await prepareCommand(h);
+  await h.turn();
+  h.engine.capture = capture;
+  await h.turn();
+  assert.equal(h.starts, 0, "unavailable queued capture must retain the failure pause");
+  h.ctx.getContextUsage = () => undefined;
+  await prepareCommand(h);
+  await h.turn();
+  assert.equal(h.starts, 1, "successful queued capture clears the failure pause");
+  await h.emit("session_shutdown");
+});
+
+for (const change of ["session", "navigation", "model", "settings", "abort", "thinking"] as const)
+  test(`queued capture cannot start after reentrant ${change} invalidation`, async () => {
+    const h = fixture();
+    h.ctx.getContextUsage = () => undefined;
+    await h.emit("session_start");
+    await prepareCommand(h);
+    const capture = h.engine.capture;
+    h.engine.capture = (ctx) => {
+      const preparation = capture(ctx);
+      if (change === "session") h.ctx.sessionManager.getSessionId = () => "other";
+      else if (change === "model")
+        h.ctx.model = { ...h.ctx.model, id: "other" } as NonNullable<ExtensionContext["model"]>;
+      else if (change === "settings") h.settings.asyncRetryCount++;
+      else if (change === "abort") h.run.abort();
+      else void h.emit(change === "navigation" ? "session_before_tree" : "thinking_level_select");
+      return preparation;
+    };
+    await h.turn();
+    assert.equal(h.starts, 0);
+    await h.emit("session_shutdown");
+  });
+
+test("queued preparation preserves apply/log setting semantics and applies only at a later safe boundary", async () => {
+  const h = fixture();
+  h.ctx.getContextUsage = () => undefined;
+  h.settings.asyncAutoApply = false;
+  await h.emit("session_start");
+  await prepareCommand(h);
+  h.settings.asyncAutoApply = true;
+  h.settings.logCompaction = false;
+  assert.equal(await h.turn(), undefined, "starting preparation cannot return a draft from the same boundary");
+  await drain();
+  assert.equal(h.starts, 1);
+  assert.ok(await h.turn());
+  assert.equal(h.starts, 1);
+  await h.emit("session_shutdown");
+});
+
+for (const callback of ["isCurrent", "available"] as const)
+  test(`final ${callback} reentrancy cannot start stale queued preparation`, async () => {
+    const h = fixture();
+    h.ctx.getContextUsage = () => undefined;
+    await h.emit("session_start");
+    await prepareCommand(h);
+    let checks = 0;
+    if (callback === "isCurrent") {
+      const capture = h.engine.capture;
+      h.engine.capture = (ctx) => {
+        const preparation = capture(ctx);
+        assert.ok(preparation);
+        return {
+          ...preparation,
+          isCurrent: () => {
+            if (++checks === 2) void h.emit("session_before_tree");
+            return true;
+          },
+        };
+      };
+    } else {
+      h.engine.available = () => {
+        if (++checks === 3) void h.emit("thinking_level_select");
+        return true;
+      };
+    }
+    await h.turn();
+    assert.equal(h.starts, 0);
+    await h.emit("session_shutdown");
+  });

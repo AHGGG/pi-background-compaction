@@ -45,6 +45,14 @@ type Owner = {
   generation: number;
   operation?: AbortController;
   compactionPending?: boolean;
+  queuedPreparation?: {
+    settingsKey: string;
+    provider?: string;
+    model?: string;
+    generation: number;
+    signal?: AbortSignal;
+    dispose(): void;
+  };
   boundaryCheckpoint?: { job: BackgroundJob; checkpointId: string; timing?: string };
   autoApply?: { job: BackgroundJob; done: Promise<void>; release(): void; cancelled?: boolean };
 };
@@ -71,11 +79,13 @@ export function createBackgroundCompactionExtension(
       if (owner?.controller.signal.aborted) return owner;
       const sessionId = ctx.sessionManager.getSessionId();
       if (!owner || owner.sessionId !== sessionId) {
+        const hadQueuedPreparation = !!owner?.queuedPreparation;
         owner?.controller.abort();
         owner?.autoApply?.release();
         owner = { controller: new AbortController(), sessionId, generation: 0 };
         owners.set(ctx.sessionManager, owner);
         activeManagers.add(ctx.sessionManager);
+        if (hadQueuedPreparation) ctx.ui.setStatus(STATUS_KEY, undefined);
       }
       return owner;
     };
@@ -118,6 +128,24 @@ export function createBackgroundCompactionExtension(
       const owner = owners.get(ctx.sessionManager);
       if (ctx.hasUI && runtime.get().settings.logCompaction && owner && owned(ctx, owner))
         ctx.ui.notify(`[background-compaction] ${message}`, "info");
+    };
+    const clearQueuedPreparation = (ctx: ExtensionContext, owner: Owner) => {
+      const queued = owner.queuedPreparation;
+      if (!queued) return;
+      owner.queuedPreparation = undefined;
+      queued.dispose();
+      if (owned(ctx, owner) && !owner.job) ctx.ui.setStatus(STATUS_KEY, undefined);
+    };
+    const queuedPreparationIsCurrent = (ctx: ExtensionContext, owner: Owner, queued = owner.queuedPreparation) => {
+      return (
+        !!queued &&
+        owned(ctx, owner) &&
+        !queued.signal?.aborted &&
+        owner.generation === queued.generation &&
+        queued.settingsKey === compactionSettingsKey(runtime.get().settings) &&
+        queued.provider === ctx.model?.provider &&
+        queued.model === ctx.model?.id
+      );
     };
     const cancelJob = (ctx: ExtensionContext, reason?: string) => {
       const owner = owners.get(ctx.sessionManager);
@@ -201,6 +229,7 @@ export function createBackgroundCompactionExtension(
         if (ctx.hasUI) ctx.ui.notify("Warm-ahead is not paused.", "info");
         return;
       }
+      clearQueuedPreparation(ctx, owner);
       owner.generation += 1;
       owner.pauseReason = undefined;
       cancelJob(ctx, "warm-ahead explicitly resumed");
@@ -262,13 +291,16 @@ export function createBackgroundCompactionExtension(
     };
     const stopPreparation = (ctx: ExtensionContext) => {
       confirmBoundary(ctx);
-      const job = owners.get(ctx.sessionManager)?.job;
+      const owner = owners.get(ctx.sessionManager);
+      if (owner) clearQueuedPreparation(ctx, owner);
+      const job = owner?.job;
       if (job?.state === "Ready" && job.isCurrent()) attempted.add(job);
       else if (job) cancelJob(ctx, job.validationFailure ?? "main run was cancelled");
     };
     const beforeCompact: PreparedCompactionSource["beforeCompact"] = async (event, ctx, guard) => {
       const owner = ownerFor(ctx);
       if (!owned(ctx, owner)) return { kind: "absent" };
+      clearQueuedPreparation(ctx, owner);
       owner.operation?.abort();
       const operation = new AbortController();
       owner.operation = operation;
@@ -530,8 +562,8 @@ export function createBackgroundCompactionExtension(
       };
       void started.promise.then(settled, settled);
     };
-    const prepareNow = (ctx: ExtensionContext, owner: Owner) => {
-      if (!owned(ctx, owner)) return;
+    const prepareNow = (ctx: ExtensionContext, owner: Owner, queued?: Owner["queuedPreparation"]) => {
+      if (!owned(ctx, owner) || (queued && !queuedPreparationIsCurrent(ctx, owner, queued))) return;
       const notify = (message: string) => {
         if (ctx.hasUI) ctx.ui.notify(message, "info");
       };
@@ -549,15 +581,8 @@ export function createBackgroundCompactionExtension(
         );
         return;
       }
-      if (
-        !ctx.isIdle() ||
-        ctx.hasPendingMessages() ||
-        ctx.signal?.aborted ||
-        owner.operation ||
-        owner.compactionPending ||
-        owner.autoApply
-      ) {
-        notify("Wait until the current model/tool run or compaction finishes, then choose Prepare now.");
+      if (ctx.signal?.aborted || owner.operation || owner.compactionPending || owner.autoApply) {
+        notify("Wait until cancellation or compaction finishes, then choose Prepare now.");
         return;
       }
       const previous = owner.job;
@@ -569,16 +594,61 @@ export function createBackgroundCompactionExtension(
         );
         return;
       }
+      if (!queued && (!ctx.isIdle() || ctx.hasPendingMessages())) {
+        if (queuedPreparationIsCurrent(ctx, owner)) {
+          notify(
+            "Background preparation is already queued for the next successful model/tool batch; no new request started.",
+          );
+          return;
+        }
+        clearQueuedPreparation(ctx, owner);
+        const signal = ctx.signal;
+        owner.generation += 1;
+        const cancel = () => clearQueuedPreparation(ctx, owner);
+        owner.queuedPreparation = {
+          settingsKey: compactionSettingsKey(runtime.get().settings),
+          provider: ctx.model?.provider,
+          model: ctx.model?.id,
+          generation: owner.generation,
+          signal,
+          dispose: () => {
+            signal?.removeEventListener("abort", cancel);
+            owner.controller.signal.removeEventListener("abort", cancel);
+          },
+        };
+        signal?.addEventListener("abort", cancel, { once: true });
+        owner.controller.signal.addEventListener("abort", cancel, { once: true });
+        ctx.ui.setStatus(STATUS_KEY, "Background preparation queued…");
+        notify("Background preparation queued for the next successful model/tool batch. The agent can keep working.");
+        return;
+      }
+      clearQueuedPreparation(ctx, owner);
       const generation = owner.generation;
+      const settingsKey = compactionSettingsKey(runtime.get().settings);
+      const provider = ctx.model?.provider;
+      const model = ctx.model?.id;
+      const canStart = () =>
+        engine?.available(ctx) &&
+        owned(ctx, owner) &&
+        owner.generation === generation &&
+        (!queued || queuedPreparationIsCurrent(ctx, owner, queued)) &&
+        !owner.queuedPreparation &&
+        ctx.model?.provider === provider &&
+        ctx.model?.id === model &&
+        runtime.get().kind !== "invalid" &&
+        settingsKey === compactionSettingsKey(runtime.get().settings) &&
+        !ctx.signal?.aborted &&
+        !owner.operation &&
+        !owner.compactionPending &&
+        !owner.autoApply;
       const preparation = engine.capture(ctx);
       if (!preparation) {
         notify("No background preparation is available for the current history. History is unchanged.");
         return;
       }
-      if (!owned(ctx, owner) || owner.generation !== generation || owner.job !== previous || !preparation.isCurrent())
-        return;
+      if (!preparation.isCurrent() || !canStart() || owner.job !== previous) return;
       cancelJob(ctx, "background preparation explicitly requested");
-      if (!owned(ctx, owner) || owner.generation !== generation || owner.job) return;
+      if (!preparation.isCurrent() || !canStart() || owner.job) return;
       owner.generation += 1;
       owner.pauseReason = undefined;
       requestSizes.delete(ctx.sessionManager);
@@ -591,10 +661,10 @@ export function createBackgroundCompactionExtension(
     };
 
     pi.registerCommand("background-compaction", {
-      description: "Prepare background compaction now, configure settings, or show diagnostics",
+      description: "Prepare background compaction now or queue it, configure settings, or show diagnostics",
       getArgumentCompletions: (prefix) =>
         [
-          { value: "prepare", label: "prepare — start background preparation now" },
+          { value: "prepare", label: "prepare — prepare now or after the current model/tool batch" },
           { value: "resume", label: "resume — retry background preparation" },
           { value: "diagnostics", label: "diagnostics — show current and last failed preparation reports" },
         ].filter(({ value }) => value.startsWith(prefix)),
@@ -622,7 +692,11 @@ export function createBackgroundCompactionExtension(
           signal: owner.controller.signal,
           isCurrent: () => owned(ctx, owner),
           backgroundStatus: () =>
-            owner.job?.state === "Preparing" || owner.job?.state === "Ready" ? owner.job.state : undefined,
+            queuedPreparationIsCurrent(ctx, owner)
+              ? "Queued"
+              : owner.job?.state === "Preparing" || owner.job?.state === "Ready"
+                ? owner.job.state
+                : undefined,
           lastPreparationStatus: () => (owner.lastPreparation ? preparationStatus(owner.lastPreparation) : undefined),
           preparationStatus: () =>
             owner.job?.state === "Preparing"
@@ -637,6 +711,8 @@ export function createBackgroundCompactionExtension(
           onPrepareNow: () => prepareNow(ctx, owner),
           onResumeWarm: () => resume(ctx, owner),
           onSettingsChanged: () => {
+            clearQueuedPreparation(ctx, owner);
+            owner.generation += 1;
             owner.operation?.abort();
             cancelJob(ctx, "settings changed in the compaction menu");
           },
@@ -700,7 +776,8 @@ export function createBackgroundCompactionExtension(
           job.isCurrent()
         )
           awaitingCompletedTurn.add(job);
-        else stopPreparation(ctx);
+        else if (event.outcome !== "error" || ctx.signal?.aborted) stopPreparation(ctx);
+        else if (job) cancelJob(ctx);
         return;
       }
       const previous = owner.job;
@@ -766,6 +843,18 @@ export function createBackgroundCompactionExtension(
           if (timings && !returned) log(ctx, timings.message());
         }
       }
+      if (owner.queuedPreparation) {
+        const queued = owner.queuedPreparation;
+        clearQueuedPreparation(ctx, owner);
+        // Consume once, on the completed model/tool batch only. Never await the
+        // provider, capture partial tools, or prepare over a concurrent history edit.
+        if (
+          !owner.queuedPreparation &&
+          !(event.entries ?? []).some((entry) => entry.type === "compaction" || entry.type === "context_edit")
+        )
+          prepareNow(ctx, owner, queued);
+        return;
+      }
       const settings = runtime.get().settings;
       if (
         !engine ||
@@ -804,6 +893,7 @@ export function createBackgroundCompactionExtension(
     pi.on("session_compact", (_event, ctx) => {
       requestSizes.delete(ctx.sessionManager);
       const owner = owners.get(ctx.sessionManager);
+      if (owner) clearQueuedPreparation(ctx, owner);
       if (owner?.compactionPending) {
         owner.compactionPending = false;
         log(ctx, "Actual compaction completed: checkpoint committed.");
@@ -840,7 +930,11 @@ export function createBackgroundCompactionExtension(
       requestSizes.delete(ctx.sessionManager);
       const owner = owners.get(ctx.sessionManager);
       owner?.operation?.abort();
-      if (owner) owner.compactionPending = false;
+      if (owner) {
+        clearQueuedPreparation(ctx, owner);
+        owner.generation += 1;
+        owner.compactionPending = false;
+      }
       cancelJob(ctx, "session navigation or model/thinking-level selection");
     };
     pi.on("session_before_switch", navigate);
@@ -848,7 +942,12 @@ export function createBackgroundCompactionExtension(
     pi.on("session_before_tree", navigate);
     pi.on("thinking_level_select", (_event, ctx) => {
       requestSizes.delete(ctx.sessionManager);
-      const job = owners.get(ctx.sessionManager)?.job;
+      const owner = owners.get(ctx.sessionManager);
+      const job = owner?.job;
+      if (owner) {
+        clearQueuedPreparation(ctx, owner);
+        owner.generation += 1;
+      }
       // The engine owns format-specific validity. Older engines retain their strict check.
       if (job && !job.isCurrent()) navigate(_event, ctx);
     });
